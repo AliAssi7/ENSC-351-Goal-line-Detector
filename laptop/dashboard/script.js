@@ -1,3 +1,4 @@
+const socket = io();
 
 const simulateBtn = document.getElementById("simulateBtn");
 const confirmBtn = document.getElementById("confirmBtn");
@@ -9,57 +10,102 @@ const decisionDescription = document.getElementById("decisionDescription");
 const eventTag = document.getElementById("eventTag");
 const eventHistory = document.getElementById("eventHistory");
 const goalCount = document.getElementById("goalCount");
+const systemStatus = document.querySelector(".system-status");
 
-let goals = 0;
-let pending = false;
-let eventNumber = 0;
+let pending = null;
 
-simulateBtn.addEventListener("click", () => {
-    if (pending) return;
+simulateBtn.disabled = true;
+confirmBtn.disabled = true;
+rejectBtn.disabled = true;
 
-    pending = true;
-    eventNumber++;
-
-    reviewStatus.textContent = "Pending";
-    decisionTitle.textContent = "Potential Goal";
-    decisionDescription.textContent = "Simulated goal-line event detected.";
-    eventTag.textContent = "Review Required";
-
-    confirmBtn.disabled = false;
-    rejectBtn.disabled = false;
+socket.on("connect", () => {
+    systemStatus.textContent = "Demo Mode - Connected";
 });
 
-function finishReview(decision) {
-    if (!pending) return;
-
-    pending = false;
-
-    const confirmed = decision === "GOAL";
-    if (confirmed) goals++;
-
-    goalCount.textContent = goals;
-    reviewStatus.textContent = "Ready";
-    decisionTitle.textContent = confirmed ? "Goal Confirmed" : "No Goal";
-    decisionDescription.textContent = "Review completed.";
-    eventTag.textContent = "Reviewed";
-
+socket.on("disconnect", () => {
+    systemStatus.textContent = "Server Disconnected";
+    simulateBtn.disabled = true;
     confirmBtn.disabled = true;
     rejectBtn.disabled = true;
+});
 
-    if (eventNumber === 1) eventHistory.textContent = "";
+socket.on("update", (state) => {
+    pending = state.pending;
+    goalCount.textContent = state.goals;
 
-    const entry = document.createElement("div");
-    entry.className = "history-entry";
+    simulateBtn.disabled = !socket.connected || pending !== null;
+    confirmBtn.disabled = !socket.connected || pending === null;
+    rejectBtn.disabled = !socket.connected || pending === null;
 
-    const label = document.createElement("span");
-    label.textContent = `Event #${eventNumber} — ${decision}`;
+    if (pending) {
+        reviewStatus.textContent = "Pending";
+        decisionTitle.textContent = "Potential Goal";
+        decisionDescription.textContent = "Goal-line event detected.";
+        eventTag.textContent = "Review Required";
+    } else {
+        reviewStatus.textContent = "Ready";
 
-    const time = document.createElement("span");
-    time.textContent = new Date().toLocaleTimeString();
+        if (state.history.length > 0) {
+            const last = state.history[0];
 
-    entry.append(label, time);
-    eventHistory.prepend(entry);
+            decisionTitle.textContent =
+                last.decision === "GOAL" ? "Goal Confirmed" : "No Goal";
+
+            decisionDescription.textContent = "Review completed.";
+            eventTag.textContent = "Reviewed";
+        } else {
+            decisionTitle.textContent = "No Pending Review";
+            decisionDescription.textContent = "Waiting for a goal-line event.";
+            eventTag.textContent = "Waiting";
+        }
+    }
+
+    showHistory(state.history);
+});
+
+function showHistory(history) {
+    eventHistory.textContent = "";
+
+    if (history.length === 0) {
+        eventHistory.textContent = "No events recorded yet.";
+        return;
+    }
+
+    history.forEach((event) => {
+        const entry = document.createElement("div");
+        entry.className = "history-entry";
+
+        const label = document.createElement("span");
+        label.textContent = `Event #${event.id} - ${event.decision}`;
+
+        const time = document.createElement("span");
+        time.textContent = new Date(event.time).toLocaleTimeString();
+
+        entry.append(label, time);
+        eventHistory.appendChild(entry);
+    });
 }
 
-confirmBtn.addEventListener("click", () => finishReview("GOAL"));
-rejectBtn.addEventListener("click", () => finishReview("NO GOAL"));
+simulateBtn.addEventListener("click", () => {
+    if (socket.connected && !pending) {
+        socket.emit("simulateGoal");
+    }
+});
+
+confirmBtn.addEventListener("click", () => {
+    if (socket.connected && pending) {
+        socket.emit("decision", {
+            id: pending.id,
+            result: "GOAL"
+        });
+    }
+});
+
+rejectBtn.addEventListener("click", () => {
+    if (socket.connected && pending) {
+        socket.emit("decision", {
+            id: pending.id,
+            result: "NO GOAL"
+        });
+    }
+});
