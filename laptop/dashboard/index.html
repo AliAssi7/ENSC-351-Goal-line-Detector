@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>True Goal</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="script.js" defer></script>
+</head>
+<body>
+    <header>
+        <div class="brand">
+            <img src="true-goal.png" class="logo" alt="True Goal">
+        </div>
+        <span class="system-status">Demo Mode</span>
+    </header>
+
+    <main>
+        <section class="overview">
+            <div>
+                <h2>Referee Dashboard</h2>
+                <p>Goal-Line Technology</p>
+            </div>
+            <button id="simulateBtn" class="primary">Simulate Event</button>
+        </section>
+
+        <section class="stats">
+            <div class="stat-card">
+                <span>Confirmed Goals</span>
+                <strong id="goalCount">0</strong>
+            </div>
+
+            <div class="stat-card">
+                <span>IR Sensors</span>
+                <strong class="muted">Disconnected</strong>
+            </div>
+
+            <div class="stat-card">
+                <span>AI Camera</span>
+                <strong class="muted">Offline</strong>
+            </div>
+
+            <div class="stat-card">
+                <span>Review Status</span>
+                <strong id="reviewStatus">Ready</strong>
+            </div>
+        </section>
+
+        <section class="workspace">
+            <div class="card camera-card">
+                <div class="card-heading">
+                    <h3>Goal-Line Camera</h3>
+                    <span class="tag">Offline</span>
+                </div>
+
+                <div class="camera-view">
+                    <div class="camera-placeholder">
+                        <h3>No Camera Signal</h3>
+                    </div>
+                </div>
+
+                <div class="camera-footer">
+                    <span>BeagleY-AI</span>
+                    <span>Camera 01</span>
+                </div>
+            </div>
+
+            <div class="card review-card">
+                <div class="card-heading">
+                    <h3>Goal Review</h3>
+                    <span class="tag" id="eventTag">Waiting</span>
+                </div>
+
+                <div class="decision-display" id="decisionDisplay">
+                    <h2 id="decisionTitle">No Pending Review</h2>
+                    <p id="decisionDescription">
+                        Waiting for a goal-line event.
+                    </p>
+                </div>
+
+                <div class="review-actions">
+                    <button id="confirmBtn" class="confirm" disabled>
+                        Confirm Goal
+                    </button>
+                    <button id="rejectBtn" class="reject" disabled>
+                        No Goal
+                    </button>
+                </div>
+            </div>
+        </section>
+
+        <section class="card history">
+            <div class="card-heading">
+                <h3>Event History</h3>
+                <span class="tag">Current Session</span>
+            </div>
+
+            <div id="eventHistory" class="empty-history">
+                No events recorded yet.
+            </div>
+        </section>
+    </main>
+</body>
+</html>
