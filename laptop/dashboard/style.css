@@ -1,0 +1,327 @@
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    background: black;
+    color: whitesmoke;
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 14px;
+}
+
+header {
+    background: black;
+    border-bottom: 2px solid crimson;
+    padding: 5px 4%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 15px;
+}
+
+.brand {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+}
+
+.logo {
+    width: 320px;
+    max-width: 100%;
+    height: auto;
+    display: block;
+}
+
+h1, h2, h3, p {
+    margin: 0;
+}
+
+.system-status {
+    color: darkgray;
+    font-size: 13px;
+    white-space: nowrap;
+}
+
+main {
+    width: 92%;
+    max-width: 1400px;
+    margin: 28px auto;
+}
+
+.overview {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 22px;
+    gap: 20px;
+}
+
+.overview h2 {
+    font-size: 25px;
+    margin-bottom: 7px;
+}
+
+.overview p {
+    color: darkgray;
+    font-size: 13px;
+}
+
+button {
+    padding: 10px 16px;
+    border: 1px solid dimgray;
+    border-radius: 3px;
+    background: rgb(35, 35, 35);
+    color: whitesmoke;
+    font-family: inherit;
+    font-size: 13px;
+    cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+    background: dimgray;
+}
+
+button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+button:focus-visible {
+    outline: 2px solid silver;
+    outline-offset: 3px;
+}
+
+.primary {
+    background: darkred;
+    border-color: firebrick;
+}
+
+.primary:hover:not(:disabled) {
+    background: firebrick;
+}
+
+.stats {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    background: rgb(20, 20, 20);
+    border: 1px solid dimgray;
+    margin-bottom: 20px;
+}
+
+.stat-card {
+    padding: 20px;
+    border-right: 1px solid dimgray;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.stat-card:last-child {
+    border-right: none;
+}
+
+.stat-card span {
+    font-size: 13px;
+    color: darkgray;
+}
+
+.stat-card strong {
+    font-size: 26px;
+    font-weight: 600;
+}
+
+#goalCount {
+    color: crimson;
+    font-size: 30px;
+}
+
+.stat-card .muted {
+    font-size: 20px;
+    color: darkgray;
+}
+
+.workspace {
+    display: grid;
+    grid-template-columns: 2fr 1fr;
+    gap: 16px;
+    margin-bottom: 20px;
+}
+
+.card {
+    background: rgb(20, 20, 20);
+    border: 1px solid dimgray;
+    border-radius: 3px;
+    padding: 16px;
+    min-width: 0;
+}
+
+.card-heading {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    padding-bottom: 13px;
+    margin-bottom: 14px;
+    border-bottom: 1px solid dimgray;
+}
+
+.card-heading h3 {
+    font-size: 16px;
+    border-left: 3px solid crimson;
+    padding-left: 10px;
+}
+
+.tag {
+    color: darkgray;
+    font-size: 12px;
+}
+
+.camera-view {
+    background: black;
+    border: 1px solid dimgray;
+    aspect-ratio: 16 / 9;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+}
+
+.camera-view img,
+.camera-view video {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+
+.camera-placeholder {
+    padding: 20px;
+    text-align: center;
+}
+
+.camera-placeholder h3 {
+    color: darkgray;
+    font-size: 16px;
+    font-weight: normal;
+}
+
+.camera-footer {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    color: darkgray;
+    font-size: 12px;
+    margin-top: 12px;
+}
+
+.review-card {
+    display: flex;
+    flex-direction: column;
+}
+
+.decision-display {
+    flex: 1;
+    padding: 30px 5px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+}
+
+.decision-display h2 {
+    font-size: 22px;
+    margin-bottom: 10px;
+}
+
+.decision-display p {
+    color: darkgray;
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.review-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding-top: 15px;
+    border-top: 1px solid dimgray;
+}
+
+.confirm {
+    background: darkgreen;
+    border-color: forestgreen;
+    color: white;
+}
+
+.confirm:hover:not(:disabled) {
+    background: forestgreen;
+}
+
+.reject {
+    background: darkred;
+    border-color: firebrick;
+    color: white;
+}
+
+.reject:hover:not(:disabled) {
+    background: firebrick;
+}
+
+.history {
+    min-height: 150px;
+}
+
+.empty-history {
+    color: darkgray;
+    font-size: 13px;
+}
+
+.history-entry {
+    display: flex;
+    justify-content: space-between;
+    gap: 15px;
+    padding: 13px 0;
+    border-bottom: 1px solid dimgray;
+    color: silver;
+    font-size: 13px;
+}
+
+.history-entry:last-child {
+    border-bottom: none;
+}
+
+@media (max-width: 900px) {
+    .workspace {
+        grid-template-columns: 1fr;
+    }
+
+    .stats {
+        grid-template-columns: repeat(2, 1fr);
+    }
+
+    .stat-card:nth-child(2) {
+        border-right: none;
+    }
+
+    .stat-card:nth-child(-n+2) {
+        border-bottom: 1px solid dimgray;
+    }
+}
+
+@media (max-width: 500px) {
+    .overview {
+        flex-direction: column;
+        align-items: flex-start;
+    }
+
+    .stat-card {
+        padding: 14px;
+    }
+
+    .camera-footer {
+        flex-wrap: wrap;
+    }
+
+    .logo {
+        width: 180px;
+    }
+}
