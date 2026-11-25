@@ -33,12 +33,12 @@
 
             <div class="stat-card">
                 <span>IR Sensors</span>
-                <strong class="muted">Disconnected</strong>
+                <strong id="irStatus" class="muted">Disconnected</strong>
             </div>
 
             <div class="stat-card">
                 <span>AI Camera</span>
-                <strong class="muted">Offline</strong>
+                <strong id="cameraStatus" class="muted">Offline</strong>
             </div>
 
             <div class="stat-card">
@@ -51,17 +51,29 @@
             <div class="card camera-card">
                 <div class="card-heading">
                     <h3>Goal-Line Camera</h3>
-                    <span class="tag">Offline</span>
+                    <span class="tag" id="cameraTag">Offline</span>
                 </div>
 
                 <div class="camera-view">
-                    <div class="camera-placeholder">
-                        <h3>No Camera Signal</h3>
+                    <img id="cameraStream" alt="Live camera" hidden>
+                    <canvas id="cameraCanvas" hidden></canvas>
+                    <div class="camera-placeholder" id="cameraPlaceholder">
+                        <h3 id="cameraMessage">No Camera Signal</h3>
                     </div>
                 </div>
 
+                <div class="replay-controls" id="replayControls" hidden>
+                    <button id="prevBtn">Previous</button>
+                    <button id="playBtn">Play</button>
+                    <button id="nextBtn">Next</button>
+                    <input type="range" id="replaySlider" min="0" max="0" value="0"
+                           aria-label="Replay frame">
+                    <span id="replayLabel">No replay footage</span>
+                </div>
+
                 <div class="camera-footer">
-                    <span>BeagleY-AI</span>
+                    <span id="cameraInfo">BeagleY-AI</span>
+                    <button id="calibrateBtn" disabled>Calibrate Line</button>
                     <span>Camera 01</span>
                 </div>
             </div>
@@ -77,6 +89,7 @@
                     <p id="decisionDescription">
                         Waiting for a goal-line event.
                     </p>
+                    <p id="replayStatus"></p>
                 </div>
 
                 <div class="review-actions">
