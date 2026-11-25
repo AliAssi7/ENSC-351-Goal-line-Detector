@@ -4,16 +4,16 @@
 
 body {
     margin: 0;
-    background: black;
-    color: whitesmoke;
+    background: whitesmoke;
+    color: black;
     font-family: Arial, Helvetica, sans-serif;
     font-size: 14px;
 }
 
 header {
     background: black;
-    border-bottom: 2px solid crimson;
-    padding: 5px 4%;
+    border-bottom: 3px solid darkorange;
+    padding: 8px 4%;
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -27,7 +27,7 @@ header {
 }
 
 .logo {
-    width: 320px;
+    width: 300px;
     max-width: 100%;
     height: auto;
     display: block;
@@ -38,7 +38,7 @@ h1, h2, h3, p {
 }
 
 .system-status {
-    color: darkgray;
+    color: lightgray;
     font-size: 13px;
     white-space: nowrap;
 }
@@ -63,23 +63,24 @@ main {
 }
 
 .overview p {
-    color: darkgray;
+    color: dimgray;
     font-size: 13px;
 }
 
 button {
     padding: 10px 16px;
-    border: 1px solid dimgray;
-    border-radius: 3px;
-    background: rgb(35, 35, 35);
-    color: whitesmoke;
+    border: 1px solid royalblue;
+    border-radius: 2px;
+    background: royalblue;
+    color: white;
     font-family: inherit;
     font-size: 13px;
+    font-weight: 600;
     cursor: pointer;
 }
 
 button:hover:not(:disabled) {
-    background: dimgray;
+    filter: brightness(0.9);
 }
 
 button:disabled {
@@ -88,30 +89,29 @@ button:disabled {
 }
 
 button:focus-visible {
-    outline: 2px solid silver;
-    outline-offset: 3px;
+    outline: 2px solid black;
+    outline-offset: 2px;
 }
 
-.primary {
-    background: darkred;
-    border-color: firebrick;
-}
-
-.primary:hover:not(:disabled) {
-    background: firebrick;
+.primary,
+.confirm {
+    background: darkorange;
+    border-color: darkorange;
+    color: black;
 }
 
 .stats {
     display: grid;
     grid-template-columns: repeat(4, 1fr);
-    background: rgb(20, 20, 20);
-    border: 1px solid dimgray;
+    background: white;
+    border: 1px solid lightgray;
+    border-top: 3px solid darkorange;
     margin-bottom: 20px;
 }
 
 .stat-card {
     padding: 20px;
-    border-right: 1px solid dimgray;
+    border-right: 1px solid lightgray;
     display: flex;
     flex-direction: column;
     gap: 12px;
@@ -123,7 +123,7 @@ button:focus-visible {
 
 .stat-card span {
     font-size: 13px;
-    color: darkgray;
+    color: dimgray;
 }
 
 .stat-card strong {
@@ -132,13 +132,12 @@ button:focus-visible {
 }
 
 #goalCount {
-    color: crimson;
     font-size: 30px;
 }
 
 .stat-card .muted {
     font-size: 20px;
-    color: darkgray;
+    color: dimgray;
 }
 
 .workspace {
@@ -149,9 +148,9 @@ button:focus-visible {
 }
 
 .card {
-    background: rgb(20, 20, 20);
-    border: 1px solid dimgray;
-    border-radius: 3px;
+    background: white;
+    border: 1px solid lightgray;
+    border-radius: 2px;
     padding: 16px;
     min-width: 0;
 }
@@ -163,23 +162,23 @@ button:focus-visible {
     gap: 10px;
     padding-bottom: 13px;
     margin-bottom: 14px;
-    border-bottom: 1px solid dimgray;
+    border-bottom: 1px solid lightgray;
 }
 
 .card-heading h3 {
     font-size: 16px;
-    border-left: 3px solid crimson;
+    border-left: 3px solid darkorange;
     padding-left: 10px;
 }
 
 .tag {
-    color: darkgray;
+    color: royalblue;
     font-size: 12px;
+    font-weight: 600;
 }
 
 .camera-view {
     background: black;
-    border: 1px solid dimgray;
     aspect-ratio: 16 / 9;
     display: flex;
     align-items: center;
@@ -188,12 +187,7 @@ button:focus-visible {
 }
 
 .camera-view img,
-.camera-view video {
-    width: 100%;
-    height: 100%;
-    object-fit: contain;
-}
-
+.camera-view video,
 .camera-view canvas {
     width: 100%;
     height: 100%;
@@ -202,6 +196,17 @@ button:focus-visible {
 
 .camera-view canvas.calibrating {
     cursor: crosshair;
+}
+
+.camera-placeholder {
+    padding: 20px;
+    text-align: center;
+}
+
+.camera-placeholder h3 {
+    color: darkgray;
+    font-size: 16px;
+    font-weight: normal;
 }
 
 .replay-controls {
@@ -218,29 +223,13 @@ button:focus-visible {
 .replay-controls input {
     flex: 1;
     min-width: 0;
-    accent-color: crimson;
+    accent-color: royalblue;
 }
 
 .replay-controls span {
-    color: darkgray;
+    color: dimgray;
     font-size: 12px;
     white-space: nowrap;
-}
-
-.camera-footer button {
-    padding: 4px 10px;
-    font-size: 12px;
-}
-
-.camera-placeholder {
-    padding: 20px;
-    text-align: center;
-}
-
-.camera-placeholder h3 {
-    color: darkgray;
-    font-size: 16px;
-    font-weight: normal;
 }
 
 .camera-footer {
@@ -248,9 +237,14 @@ button:focus-visible {
     align-items: center;
     justify-content: space-between;
     gap: 10px;
-    color: darkgray;
+    color: dimgray;
     font-size: 12px;
     margin-top: 12px;
+}
+
+.camera-footer button {
+    padding: 4px 10px;
+    font-size: 12px;
 }
 
 .review-card {
@@ -272,7 +266,7 @@ button:focus-visible {
 }
 
 .decision-display p {
-    color: darkgray;
+    color: dimgray;
     font-size: 13px;
     line-height: 1.5;
 }
@@ -282,27 +276,7 @@ button:focus-visible {
     flex-direction: column;
     gap: 10px;
     padding-top: 15px;
-    border-top: 1px solid dimgray;
-}
-
-.confirm {
-    background: darkgreen;
-    border-color: forestgreen;
-    color: white;
-}
-
-.confirm:hover:not(:disabled) {
-    background: forestgreen;
-}
-
-.reject {
-    background: darkred;
-    border-color: firebrick;
-    color: white;
-}
-
-.reject:hover:not(:disabled) {
-    background: firebrick;
+    border-top: 1px solid lightgray;
 }
 
 .history {
@@ -310,7 +284,7 @@ button:focus-visible {
 }
 
 .empty-history {
-    color: darkgray;
+    color: dimgray;
     font-size: 13px;
 }
 
@@ -319,9 +293,12 @@ button:focus-visible {
     justify-content: space-between;
     gap: 15px;
     padding: 13px 0;
-    border-bottom: 1px solid dimgray;
-    color: silver;
+    border-bottom: 1px solid lightgray;
     font-size: 13px;
+}
+
+.history-entry span:last-child {
+    color: dimgray;
 }
 
 .history-entry:last-child {
@@ -342,7 +319,7 @@ button:focus-visible {
     }
 
     .stat-card:nth-child(-n+2) {
-        border-bottom: 1px solid dimgray;
+        border-bottom: 1px solid lightgray;
     }
 }
 
@@ -362,5 +339,10 @@ button:focus-visible {
 
     .logo {
         width: 180px;
+    }
+
+    .system-status {
+        white-space: normal;
+        text-align: right;
     }
 }

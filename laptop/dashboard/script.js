@@ -51,7 +51,7 @@ const CAMERA_EVIDENCE = {
     unavailable: "Camera (YOLO): detection result unavailable"
 };
 const IR_LABELS = { ok: "Online", error: "Error", disabled: "Disabled", offline: "Offline" };
-const ZONE_COLORS = ["white", "gold", "orange", "crimson"];
+const ZONE_COLORS = ["white", "royalblue", "gold", "darkorange"];
 
 let state = null;
 let pending = null;
@@ -375,7 +375,7 @@ function drawOverlay(frame) {
     context.lineWidth = 1;
 
     if (line && !calibration) {
-        context.strokeStyle = "crimson";
+        context.strokeStyle = "darkorange";
         context.beginPath();
         context.moveTo(line.x1 + 0.5, line.y1 + 0.5);
         context.lineTo(line.x2 + 0.5, line.y2 + 0.5);
@@ -390,7 +390,7 @@ function drawOverlay(frame) {
     }
 
     (calibration || []).forEach((p) => {
-        context.fillStyle = "crimson";
+        context.fillStyle = "royalblue";
         context.fillRect(p.x - 2, p.y - 2, 5, 5);
     });
 }
