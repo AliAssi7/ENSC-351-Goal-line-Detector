@@ -51,7 +51,8 @@ const CAMERA_EVIDENCE = {
     unavailable: "Camera (YOLO): detection result unavailable"
 };
 const IR_LABELS = { ok: "Online", error: "Error", disabled: "Disabled", offline: "Offline" };
-const ZONE_COLORS = ["white", "royalblue", "gold", "darkorange"];
+const OK_CAMERA = ["yolo", "live", "sim", "file"];
+const CAMERA_EVIDENCE_STATUS = { seen: "ok", missed: "bad", ignored: "bad", unavailable: "bad" };
 
 let state = null;
 let pending = null;
@@ -106,18 +107,23 @@ function render() {
     const board = connected ? state.board : { connected: false };
 
     if (!socket.connected) {
-        systemStatus.textContent = "Server Disconnected";
+        setStatus(systemStatus, "Server Disconnected", "bad");
     } else if (!board.connected) {
-        systemStatus.textContent = "Demo Mode - BeagleY-AI Disconnected";
+        setStatus(systemStatus, "Demo Mode - BeagleY-AI Disconnected", "bad");
     } else {
         const modes = { monitoring: "Monitoring", review: "Reviewing", goal: "Goal Confirmed" };
-        systemStatus.textContent = `BeagleY-AI Connected - ${modes[board.state] || "Starting"}`;
+        setStatus(systemStatus, `BeagleY-AI Connected - ${modes[board.state] || "Starting"}`, "ok");
     }
 
-    setStat(irStatus, board.connected ? IR_LABELS[board.ir] || "Starting" : "Disconnected",
-        board.connected && board.ir === "ok");
-    setStat(cameraStatus, board.connected ? CAMERA_LABELS[board.camera] || "Starting" : "Disconnected",
-        board.connected && ["yolo", "live", "sim", "file"].includes(board.camera));
+    if (!board.connected) {
+        setStatus(irStatus, "Disconnected", "bad");
+        setStatus(cameraStatus, "Disconnected", "bad");
+    } else {
+        setStatus(irStatus, IR_LABELS[board.ir] || "Starting",
+            board.ir === "ok" ? "ok" : ["error", "offline"].includes(board.ir) ? "bad" : null);
+        setStatus(cameraStatus, CAMERA_LABELS[board.camera] || "Starting",
+            OK_CAMERA.includes(board.camera) ? "ok" : board.camera === "offline" ? "bad" : null);
+    }
 
     simulateBtn.disabled = !connected || pending !== null;
     confirmBtn.disabled = !connected || pending === null;
@@ -133,46 +139,60 @@ function render() {
     drawCamera();
 }
 
-function setStat(element, text, ok) {
+// status: "ok" (green), "bad" (red) or null (neutral).
+function setStatus(element, text, status) {
     element.textContent = text;
-    element.classList.toggle("muted", !ok);
+    element.classList.toggle("ok", status === "ok");
+    element.classList.toggle("bad", status === "bad");
+}
+
+function setDescription(parts) {
+    decisionDescription.textContent = "";
+
+    parts.forEach(([text, status]) => {
+        const span = document.createElement("span");
+        span.textContent = text + " ";
+        if (status) {
+            span.className = status;
+        }
+        decisionDescription.appendChild(span);
+    });
 }
 
 function renderReview() {
     if (pending) {
         const agree = pending.sources.includes("camera") && pending.sources.includes("ir");
-        const evidence = pending.sources.map((s) => SOURCE_LABELS[s]);
+        const parts = pending.sources.map((s) => [SOURCE_LABELS[s] + ".", s === "camera" ? "ok" : null]);
 
         if (pending.camera) {
-            evidence.push(CAMERA_EVIDENCE[pending.camera]);
+            parts.push([CAMERA_EVIDENCE[pending.camera] + ".", CAMERA_EVIDENCE_STATUS[pending.camera] || null]);
         }
 
-        reviewStatus.textContent = "Pending";
-        decisionTitle.textContent = `Possible Goal - Event #${pending.number}`;
-        decisionDescription.textContent =
-            evidence.join(". ") + ". " +
-            (agree ? "Camera and IR agree." : "") +
-            (pending.camera ? " The camera is supporting evidence only." : "") +
-            " Review the footage before deciding." +
-            ` Detected at ${new Date(pending.time).toLocaleTimeString()}.`;
+        parts.push([(agree ? "Camera and IR agree. " : "") +
+            (pending.camera ? "The camera is supporting evidence only. " : "") +
+            "Review the footage before deciding." +
+            ` Detected at ${new Date(pending.time).toLocaleTimeString()}.`, null]);
+
+        setStatus(reviewStatus, "Pending", null);
+        setStatus(decisionTitle, `Possible Goal - Event #${pending.number}`, null);
+        setDescription(parts);
         eventTag.textContent = "Review Required";
         return;
     }
 
-    reviewStatus.textContent = "Ready";
+    setStatus(reviewStatus, "Ready", "ok");
     replayStatus.textContent = "";
 
     if (state.history.length > 0) {
         const last = state.history[0];
+        const goal = last.decision === "GOAL";
 
-        decisionTitle.textContent =
-            last.decision === "GOAL" ? "Goal Confirmed" : "No Goal";
-
+        setStatus(decisionTitle, goal ? "Goal Confirmed" : "No Goal", goal ? "ok" : "bad");
         decisionDescription.textContent =
             `Event #${last.number} reviewed at ${new Date(last.time).toLocaleTimeString()}.`;
         eventTag.textContent = "Reviewed";
     } else {
-        decisionTitle.textContent = "No Pending Review";
+        setStatus(decisionTitle, "No Pending Review", null);
         decisionDescription.textContent = "Waiting for a goal-line event.";
         eventTag.textContent = "Waiting";
     }
@@ -383,7 +403,9 @@ function drawOverlay(frame) {
     }
 
     if (frame.ball) {
-        context.strokeStyle = ZONE_COLORS[frame.ball.zone] || "white";
+        // Wholly over the line (zone 3) gets a thicker ring.
+        context.strokeStyle = "limegreen";
+        context.lineWidth = frame.ball.zone === 3 ? 3 : 1;
         context.beginPath();
         context.arc(frame.ball.x, frame.ball.y, frame.ball.r + 3, 0, 2 * Math.PI);
         context.stroke();
@@ -408,12 +430,20 @@ function showHistory(history) {
         entry.className = "history-entry";
 
         const label = document.createElement("span");
-        const camera = {
-            seen: "; camera: ball seen", missed: "; camera: no ball",
-            ignored: "; camera: no result", unavailable: "; camera: no result"
-        }[event.camera] || "";
-        label.textContent =
-            `Event #${event.number} - ${event.decision} (${sourcesText(event.sources)}${camera})`;
+        const decision = document.createElement("span");
+        decision.textContent = event.decision;
+        decision.className = event.decision === "GOAL" ? "ok" : "bad";
+        label.append(`Event #${event.number} - `, decision, ` (${sourcesText(event.sources)}`);
+
+        if (event.camera && event.camera !== "pending") {
+            const camera = document.createElement("span");
+            camera.textContent = { seen: "camera: ball seen", missed: "camera: no ball" }[event.camera] ||
+                "camera: no result";
+            camera.className = CAMERA_EVIDENCE_STATUS[event.camera];
+            label.append("; ", camera);
+        }
+
+        label.append(")");
 
         const time = document.createElement("span");
         time.textContent = new Date(event.time).toLocaleTimeString();

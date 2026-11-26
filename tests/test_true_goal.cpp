@@ -9,6 +9,7 @@
 #include "network.h"
 #include "replay.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -437,10 +438,9 @@ struct Sent {
 
 static Sent sent;
 
-static void checkLeds(int green, int yellow, int red)
+static void checkLeds(int green, int red)
 {
     CHECK(gpio_mock::value("GPIO5") == green);
-    CHECK(gpio_mock::value("GPIO6") == yellow);
     CHECK(gpio_mock::value("GPIO26") == red);
 }
 
@@ -477,7 +477,7 @@ static void testController()
         },
         8);
 
-    checkLeds(1, 0, 0);
+    checkLeds(1, 0);
     CHECK(controller::state() == controller::State::Monitoring);
 
     // Live frames are throttled to the preview rate.
@@ -503,7 +503,7 @@ static void testController()
     std::string id = controller::eventId();
     CHECK(!id.empty());
     CHECK(sent.text.size() == 1 && sent.text[0] == "EVENT " + id + " camera");
-    checkLeds(0, 1, 0);
+    checkLeds(0, 0);
 
     // No live frames during the review; post-event frames join the replay.
     feedFrames(1056, 1056 + 66 * 5);
@@ -568,20 +568,20 @@ static void testController()
     controller::message("DECISION", 1900);
     controller::message("garbage", 1900);
     CHECK(controller::state() == controller::State::Review);
-    checkLeds(0, 1, 0);
+    checkLeds(0, 0);
 
     controller::message("DECISION " + id + " GOAL", 2000);
-    checkLeds(0, 0, 1);
+    checkLeds(1, 0);
     CHECK(controller::state() == controller::State::Goal);
-    CHECK(gpio_mock::value("GPIO25") == 1);
-    sleepMs(400);
-    CHECK(gpio_mock::value("GPIO25") == 0);
+    CHECK(buzzer::active());
+    sleepMs(1150);
+    CHECK(!buzzer::active() && gpio_mock::value("GPIO25") == 0);
 
     controller::message("DECISION " + id + " GOAL", 2100);
     controller::message("DECISION " + id + " NO_GOAL", 2100);
     controller::detected(controller::Source::Camera, 2100, 2100);
     sleepMs(50);
-    CHECK(gpio_mock::rises("GPIO25") == 1);
+    CHECK(gpio_mock::bursts("GPIO25") == 1);
     CHECK(controller::state() == controller::State::Goal);
 
     controller::tick(3000);
@@ -589,19 +589,37 @@ static void testController()
     CHECK(controller::state() == controller::State::Goal);
     controller::tick(8000);
     CHECK(controller::state() == controller::State::Monitoring);
-    checkLeds(1, 0, 0);
+    checkLeds(1, 0);
 
-    // Manual review rejected: no beep, back to monitoring.
+    // Manual review rejected: no beep, red for 5 s, then green.
     sent.clear();
     controller::message("REVIEW", 9000);
     std::string manual = controller::eventId();
     CHECK(manual != id && sent.last("EVENT") == "EVENT " + manual + " manual");
-    checkLeds(0, 1, 0);
+    checkLeds(0, 0);
     controller::message("REVIEW", 9010);
     CHECK(controller::eventId() == manual && sent.count("EVENT") == 2);
     controller::message("DECISION " + manual + " NO_GOAL", 9100);
-    checkLeds(1, 0, 0);
-    CHECK(gpio_mock::rises("GPIO25") == 1);
+    checkLeds(0, 1);
+    controller::tick(14000);
+    checkLeds(0, 1);
+    controller::tick(14100);
+    checkLeds(1, 0);
+
+    // Faults turn the LED red while monitoring.
+    controller::setIrStatus("error");
+    controller::tick(14200);
+    checkLeds(0, 1);
+    controller::setIrStatus("ok");
+    controller::tick(14300);
+    checkLeds(1, 0);
+    controller::setCameraStatus("offline");
+    controller::tick(14400);
+    checkLeds(0, 1);
+    controller::setCameraStatus("sim");
+    controller::tick(14500);
+    checkLeds(1, 0);
+    CHECK(gpio_mock::bursts("GPIO25") == 1);
 
     // Late evidence for a closed event opens a new one instead.
     controller::detected(controller::Source::Ir, 9200, 9200);
@@ -617,20 +635,20 @@ static void testController()
         controller::detected(controller::Source::Ir, now - 1000, now);
         ids.push_back(controller::eventId());
         controller::message("DECISION " + ids.back() + " GOAL", now + 100);
-        sleepMs(350);
+        sleepMs(1150);
         controller::tick(now + 200);
         controller::tick(now + 5300);
         CHECK(controller::state() == controller::State::Monitoring);
         now += 10000;
     }
-    CHECK(gpio_mock::rises("GPIO25") == 4);
+    CHECK(gpio_mock::bursts("GPIO25") == 4);
     CHECK(ids[0] != ids[1] && ids[1] != ids[2]);
 
-    // A review can start while the red LED is still held.
+    // A review can start while the goal LED is still held.
     controller::detected(controller::Source::Camera, now, now);
     controller::message("DECISION " + controller::eventId() + " GOAL", now);
     controller::message("REVIEW", now + 100);
-    checkLeds(0, 1, 0);
+    checkLeds(0, 0);
 
     // Status heartbeat.
     sent.clear();
@@ -642,7 +660,7 @@ static void testController()
     buzzer::cleanup();
     leds::cleanup();
     CHECK(!gpio_mock::isOpen("GPIO25") && !gpio_mock::isOpen("GPIO5"));
-    CHECK(gpio_mock::value("GPIO6") == 0);
+    CHECK(gpio_mock::value("GPIO26") == 0);
 
     buzzer::cleanup();
     leds::cleanup();
@@ -651,14 +669,72 @@ static void testController()
     controller::detected(controller::Source::Camera, now, now);
 }
 
-static void testBuzzerCleanupWhileOn()
+static void waitForBuzzer()
 {
+    sleepMs(20);
+    for (int i = 0; i < 300 && buzzer::active(); ++i)
+        sleepMs(5);
+    sleepMs(50);   // a gap, so the mock counts the next tone as a new burst
+}
+
+static void testPassiveBuzzer()
+{
+    using std::chrono::steady_clock;
     gpio_mock::reset();
+
+    // Silent at startup and while idle.
     CHECK(buzzer::init());
+    sleepMs(200);
+    CHECK(gpio_mock::value("GPIO25") == 0 && gpio_mock::rises("GPIO25") == 0 && !buzzer::active());
+
+    // beep() returns immediately; the tone lasts one second at 2000 Hz, 25% duty.
+    auto start = steady_clock::now();
+    buzzer::beep(1000);
+    CHECK(steady_clock::now() - start < std::chrono::milliseconds(5));
+    CHECK(buzzer::active());
+    waitForBuzzer();
+
+    int cycles = gpio_mock::rises("GPIO25");
+    double duty = 100.0 * gpio_mock::highTimeUs("GPIO25") / (cycles * 500.0);
+    long long length = gpio_mock::lastBurstMs("GPIO25");
+    std::cout << "Buzzer: " << cycles << " cycles in " << length << " ms ("
+              << cycles * 1000 / std::max(1LL, length) << " Hz), duty " << int(duty + 0.5) << "%\n";
+
+    CHECK(gpio_mock::bursts("GPIO25") == 1);
+    CHECK(length >= 995 && length <= 1010);
+    CHECK(cycles >= 1900 && cycles <= 2001);
+    CHECK(duty >= 20 && duty <= 32);
+    CHECK(gpio_mock::value("GPIO25") == 0 && !buzzer::active());
+
+    // Repeated activations while sounding neither extend nor restart the tone.
+    buzzer::beep(1000);
+    sleepMs(400);
+    buzzer::beep(1000);
+    sleepMs(400);
+    buzzer::beep(1000);
+    waitForBuzzer();
+    CHECK(gpio_mock::bursts("GPIO25") == 2);
+    CHECK(gpio_mock::lastBurstMs("GPIO25") <= 1010);
+
+    // A later, separate goal sounds again.
+    buzzer::beep(1000);
+    waitForBuzzer();
+    CHECK(gpio_mock::bursts("GPIO25") == 3);
+
+    // Shutdown in the middle of a tone stops it at once and leaves the pin low.
     buzzer::beep(5000);
-    CHECK(gpio_mock::value("GPIO25") == 1);
+    sleepMs(100);
+    CHECK(buzzer::active() && gpio_mock::bursts("GPIO25") == 4);
+    start = steady_clock::now();
     buzzer::cleanup();
+    CHECK(steady_clock::now() - start < std::chrono::milliseconds(20));
     CHECK(gpio_mock::value("GPIO25") == 0 && !gpio_mock::isOpen("GPIO25"));
+    CHECK(gpio_mock::lastBurstMs("GPIO25") < 200);
+
+    // No sound after shutdown or before init.
+    buzzer::beep(1000);
+    CHECK(!buzzer::active());
+    buzzer::cleanup();
 }
 
 // --- Camera -----------------------------------------------------------------
@@ -1227,7 +1303,7 @@ static void testControllerWithGoalCam()
     std::string id = controller::eventId();
     CHECK(captures.size() == 1 && captures[0] == id);
     CHECK(sent.count("EVENT " + id + " ir") == 1 && sent.last("CAMERA") == "CAMERA " + id + " pending pending");
-    checkLeds(0, 1, 0);
+    checkLeds(0, 0);
 
     controller::tick(10000);
     CHECK(sent.last("REPLAY") == "REPLAY " + id + " 0 0 0 0");
@@ -1280,7 +1356,7 @@ static void testControllerWithGoalCam()
     CHECK(sent.count("EVENT " + id) == 1 && sent.last("CAMERA") == "CAMERA " + id + " seen ready");
 
     controller::message("DECISION " + id + " GOAL", 21000);
-    checkLeds(0, 0, 1);
+    checkLeds(1, 0);
     sent.clear();
     controller::cameraEvidence(id, "missed", "pending");
     controller::cameraClip(id, clip, 10);
@@ -1302,7 +1378,7 @@ int main()
     testDetector();
     testReplay();
     testController();
-    testBuzzerCleanupWhileOn();
+    testPassiveBuzzer();
     testCamera();
     testNetwork();
     testAvi();

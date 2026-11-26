@@ -12,12 +12,21 @@
 
 namespace {
 
+using Clock = std::chrono::steady_clock;
+
 struct Line {
     std::string name;
     int value;
     bool output;
     bool open;
     int rises;
+
+    // Square-wave bookkeeping: a gap of more than 20 ms starts a new burst.
+    int bursts = 0;
+    long long highUs = 0;
+    Clock::time_point lastRise{};
+    Clock::time_point lastFall{};
+    Clock::time_point burstStart{};
 };
 
 std::mutex mutex;
@@ -89,8 +98,23 @@ bool set(int fd, int value)
     if (!line || !line->output)
         return false;
 
+    Clock::time_point now = Clock::now();
+
     if (!line->value && value)
+    {
         ++line->rises;
+        if (line->rises == 1 || now - line->lastFall > std::chrono::milliseconds(20))
+        {
+            ++line->bursts;
+            line->burstStart = now;
+        }
+        line->lastRise = now;
+    }
+    else if (line->value && !value)
+    {
+        line->highUs += std::chrono::duration_cast<std::chrono::microseconds>(now - line->lastRise).count();
+        line->lastFall = now;
+    }
 
     if (line->value != value && std::getenv("TRUE_GOAL_GPIO_LOG"))
         std::cerr << "[gpio " << std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -146,6 +170,29 @@ int rises(const char* name)
     std::lock_guard<std::mutex> lock(mutex);
     Line* line = find(name);
     return line ? line->rises : 0;
+}
+
+int bursts(const char* name)
+{
+    std::lock_guard<std::mutex> lock(mutex);
+    Line* line = find(name);
+    return line ? line->bursts : 0;
+}
+
+long long highTimeUs(const char* name)
+{
+    std::lock_guard<std::mutex> lock(mutex);
+    Line* line = find(name);
+    return line ? line->highUs : 0;
+}
+
+long long lastBurstMs(const char* name)
+{
+    std::lock_guard<std::mutex> lock(mutex);
+    Line* line = find(name);
+    if (!line || line->bursts == 0)
+        return 0;
+    return std::chrono::duration_cast<std::chrono::milliseconds>(line->lastFall - line->burstStart).count();
 }
 
 void reset()

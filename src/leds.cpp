@@ -10,10 +10,9 @@ struct Led {
     int fd;
 };
 
-static Led ledList[3] = {
-    {pins::kLedGreen,  Color::Green,  -1},
-    {pins::kLedYellow, Color::Yellow, -1},
-    {pins::kLedRed,    Color::Red,    -1}
+static Led ledList[2] = {
+    {pins::kLedGreen, Color::Green, -1},
+    {pins::kLedRed,   Color::Red,   -1}
 };
 
 bool init()

@@ -143,6 +143,7 @@ static void usage()
         "  --stream-port N       its MJPEG web port shown on the dashboard (default 8080)\n"
         "  --no-camera           run without any camera\n"
         "  --check-avi FILE      check that a goal_cam.py replay clip can be read, then exit\n"
+        "  --test-buzzer         sound the buzzer once (1 s) and exit\n"
         "\n"
         "Built-in test camera instead of goal_cam.py (never use both on one device):\n"
         "  --sim                 simulated pitch and ball\n"
@@ -180,7 +181,26 @@ int main(int argc, char* argv[])
         auto value = [&]() { return std::string(argv[++i]); };
         auto number = [&]() { return std::atoi(argv[++i]); };
 
-        if (arg == "--check-avi" && hasValue)
+        if (arg == "--test-buzzer")
+        {
+            if (!buzzer::init())
+            {
+                std::cerr << "Buzzer unavailable\n";
+                return 1;
+            }
+
+            std::cout << "Buzzer: 2000 Hz, 25% duty, 1 s\n";
+            buzzer::beep(1000);
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+            while (buzzer::active())
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+            buzzer::cleanup();
+            std::cout << "Buzzer off\n";
+            return 0;
+        }
+        else if (arg == "--check-avi" && hasValue)
         {
             std::vector<camera::FramePtr> frames;
             int fps = 0;
@@ -275,6 +295,8 @@ int main(int argc, char* argv[])
     replay::configure(cam.fps, 3000, 2000);
     controller::init(network::send, network::sendFrame, liveFps);
     controller::setIrStatus(useIr ? "ok" : "disabled");
+    if (noCamera)
+        controller::setCameraStatus("disabled");
 
     network::start(host, port, onServerLine, [useGoalCam, builtInCamera, streamPort] {
         if (builtInCamera)

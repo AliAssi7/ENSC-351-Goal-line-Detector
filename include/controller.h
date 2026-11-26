@@ -11,7 +11,7 @@
 
 // Decision policy:
 //  - IR: the existing beam check (beam broken, clear again 1 s later) opens
-//    a possible-goal event (yellow LED).
+//    a possible-goal event.
 //  - Manual: the referee requests a review from the dashboard.
 //  - YOLO camera (goal_cam.py): keeps the replay and reports whether it saw
 //    the ball around the trigger. This is supporting evidence only; it does
@@ -19,6 +19,9 @@
 //  - The test-only built-in camera (--sim/--video) can also open events.
 // Another source within 5 s is added to the same event as corroboration.
 // Nothing is awarded automatically: only the referee's decision sets GOAL.
+//
+// LEDs: green = operational or goal confirmed, red = fault (IR error or
+// camera offline) or no goal, both off = review pending.
 namespace controller {
 
 enum class State { Monitoring, Review, Goal };

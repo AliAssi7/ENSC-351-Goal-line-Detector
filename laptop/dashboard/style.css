@@ -1,6 +1,7 @@
 /* True Goal referee dashboard — proposal v2.
    Accent colours are sampled from true-goal.png. State-dependent styling only
-   reads state that script.js already sets (disabled buttons, .muted, [hidden]). */
+   reads state that script.js already sets (disabled buttons, .ok/.bad, [hidden]).
+   Status colours are green and red only; orange and blue are branding. */
 :root {
     --page: #f2f3f5;
     --surface: #ffffff;
@@ -8,16 +9,13 @@
     --border: #e3e5e9;
     --text: #14161b;
     --text-muted: #5e6370;
-    --text-faint: #9096a1;
     --orange: #f28212;
     --orange-dark: #d9700a;
-    --orange-tint: #fff4e8;
-    --orange-line: #f6c894;
-    --orange-text: #b45f0a;
     --blue: #0b6fe0;
     --blue-dark: #0a5cc0;
-    --online: #15803d;
-    --offline: #b4b8c0;
+    --ok: #15803d;
+    --bad: #c62828;
+    --neutral: #b4b8c0;
     /* dark camera monitor */
     --panel: #111317;
     --panel-raised: #1a1d22;
@@ -77,6 +75,14 @@ header {
     display: block;
 }
 
+.ok {
+    color: var(--ok);
+}
+
+.bad {
+    color: var(--bad);
+}
+
 .system-status {
     color: #d4d6db;
     font-size: 12px;
@@ -85,6 +91,17 @@ header {
     padding: 5px 12px;
     border: 1px solid #3a3c42;
     border-radius: 999px;
+}
+
+/* Lighter shades so the status stays readable on the black header. */
+.system-status.ok {
+    color: #5fd38a;
+    border-color: #2f6b45;
+}
+
+.system-status.bad {
+    color: #ff7b7b;
+    border-color: #7a2f2f;
 }
 
 /* Page */
@@ -225,11 +242,7 @@ button:disabled {
     line-height: 1;
 }
 
-.stat-card .muted {
-    color: var(--text-faint);
-}
-
-/* Status dots: grey while .muted (offline), green once script.js marks it online. */
+/* Status dots: grey while neutral, green for .ok, red for .bad. */
 #irStatus::before,
 #cameraStatus::before,
 #reviewStatus::before {
@@ -240,30 +253,19 @@ button:disabled {
     margin-right: 8px;
     border-radius: 50%;
     vertical-align: 0.15em;
-    background: var(--offline);
+    background: var(--neutral);
 }
 
-#irStatus:not(.muted),
-#cameraStatus:not(.muted) {
-    color: var(--online);
+#irStatus.ok::before,
+#cameraStatus.ok::before,
+#reviewStatus.ok::before {
+    background: var(--ok);
 }
 
-#irStatus:not(.muted)::before,
-#cameraStatus:not(.muted)::before {
-    background: var(--online);
-}
-
-#reviewStatus::before {
-    background: var(--text);
-}
-
-/* A review is pending exactly when Confirm Goal is enabled. */
-body:has(#confirmBtn:not(:disabled)) #reviewStatus {
-    color: var(--orange);
-}
-
-body:has(#confirmBtn:not(:disabled)) #reviewStatus::before {
-    background: var(--orange);
+#irStatus.bad::before,
+#cameraStatus.bad::before,
+#reviewStatus.bad::before {
+    background: var(--bad);
 }
 
 /* Cards */
@@ -329,12 +331,6 @@ body:has(#confirmBtn:not(:disabled)) #reviewStatus::before {
 .camera-card .tag {
     color: #b4b9c2;
     background: #22262c;
-}
-
-/* Orange only while a recorded replay is on screen. */
-.camera-card:has(#replayControls:not([hidden])) .tag {
-    color: #f5a04a;
-    background: #2a2116;
 }
 
 .camera-view {
@@ -471,10 +467,10 @@ body:has(#confirmBtn:not(:disabled)) #reviewStatus::before {
     margin-top: 8px;
 }
 
-/* While a review is pending, the decision area becomes the page's one alert. */
+/* A pending review is highlighted neutrally: it is neither a goal nor a no goal. */
 .review-card:has(#confirmBtn:not(:disabled)) .decision-display {
-    background: var(--orange-tint);
-    border-color: var(--orange-line);
+    background: var(--surface-sunken);
+    border-color: var(--border);
 }
 
 .review-card:has(#confirmBtn:not(:disabled)) .decision-display h2 {
@@ -483,11 +479,6 @@ body:has(#confirmBtn:not(:disabled)) #reviewStatus::before {
 
 .review-card:has(#confirmBtn:not(:disabled)) .decision-display p {
     color: #4a4f5a;
-}
-
-.review-card:has(#confirmBtn:not(:disabled)) .tag {
-    color: var(--orange-text);
-    background: var(--orange-tint);
 }
 
 .review-actions {
@@ -528,7 +519,7 @@ body:has(#confirmBtn:not(:disabled)) #reviewStatus::before {
     background: var(--surface-sunken);
 }
 
-.history-entry span:last-child {
+.history-entry > span:last-child {
     color: var(--text-muted);
     font-weight: 400;
     font-variant-numeric: tabular-nums;

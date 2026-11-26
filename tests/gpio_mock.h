@@ -12,6 +12,11 @@ bool isOpen(const char* name);
 // Number of low-to-high transitions written to an output.
 int rises(const char* name);
 
+// Square-wave measurements for a toggled output such as the passive buzzer.
+int bursts(const char* name);
+long long highTimeUs(const char* name);
+long long lastBurstMs(const char* name);
+
 void reset();
 
 }

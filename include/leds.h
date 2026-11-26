@@ -3,7 +3,7 @@
 
 namespace leds {
 
-enum class Color { Off, Green, Yellow, Red };
+enum class Color { Off, Green, Red };
 
 bool init();
 
