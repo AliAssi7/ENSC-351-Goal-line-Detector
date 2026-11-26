@@ -41,4 +41,10 @@ if(TRUE_GOAL_MOCK_GPIO)
     target_include_directories(true_goal_tests PRIVATE tests)
     target_link_libraries(true_goal_tests PRIVATE true_goal_core)
     add_test(NAME true_goal_tests COMMAND true_goal_tests)
+
+    # goal_cam.py's evidence code, with a stand-in for the YOLO model.
+    find_program(PYTHON3 python3)
+    if(PYTHON3)
+        add_test(NAME goal_cam_evidence COMMAND ${PYTHON3} ${CMAKE_SOURCE_DIR}/tests/test_goal_cam.py)
+    endif()
 endif()

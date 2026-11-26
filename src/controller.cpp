@@ -14,7 +14,10 @@ namespace controller {
 
 // How long the green (goal) or red (no goal) LED stays on after a decision.
 static const long long kNotifyMs = 3000;
-static const long long kEvidenceWindowMs = 5000;
+// An IR event with no final camera answer by then waits for the referee.
+static const long long kEvidenceTimeoutMs = 8000;
+// Another source within this time joins the same event.
+static const long long kCorroborationMs = 5000;
 static const long long kStatusIntervalMs = 1000;
 
 static std::mutex mutex;
@@ -26,10 +29,24 @@ static long long lastLiveMs = -1000000;
 
 static std::string session;
 static int eventCount = 0;
+
+// The event being evaluated or awaiting a decision.
 static std::string currentId;
 static std::vector<Source> sources;
+static bool manualEvent = false;
 static long long eventStartMs = 0;
-static long long goalUntil = 0;
+static std::string awaitingReason;
+static goalcam::Evidence evidence;
+static std::string replayState;   // empty when no camera replay was requested
+
+// The latest automatic goal, which the referee can replay and correct.
+static std::string autoId;
+static std::string autoSources;
+static bool autoAcknowledged = false;
+static bool autoCorrected = false;
+static bool viewing = false;
+
+static long long notifyUntil = 0;
 static leds::Color ledColor = leds::Color::Off;
 static long long ledOffAt = 0;
 
@@ -39,11 +56,7 @@ static std::string lastStatus;
 static long long lastStatusMs = 0;
 static std::string lastReplay;
 static camera::FramePtr lastReplayFrame;
-static std::function<void(const std::string&)> captureHook;
-static std::string cameraEvidenceState;
-static std::string cameraReplayState;
-
-static void sendCamera();
+static CaptureHook captureHook;
 
 static void send(const std::string& line)
 {
@@ -84,23 +97,49 @@ static const char* stateName(State state)
 {
     switch (state)
     {
-    case State::Review: return "review";
-    case State::Goal:   return "goal";
-    default:            return "monitoring";
+    case State::Evaluating: return "evaluating";
+    case State::Awaiting:   return "awaiting";
+    case State::Goal:       return "goal";
+    case State::NoGoal:     return "nogoal";
+    default:                return "monitoring";
     }
 }
 
-static void sendEvent()
+static bool reviewing()
+{
+    return current == State::Evaluating || current == State::Awaiting;
+}
+
+static std::string sourceList()
 {
     std::string list;
 
     for (Source source : sources)
         list += (list.empty() ? "" : ",") + std::string(sourceName(source));
 
-    send("EVENT " + currentId + " " + list);
+    return list;
 }
 
-// Green or red lights for kNotifyMs after a decision; otherwise both are off.
+static void sendEvent()
+{
+    send("EVENT " + currentId + " " + sourceList());
+}
+
+static void sendCamera(const std::string& id)
+{
+    send("CAMERA " + id + " " + evidence.result + " " + replayState);
+
+    if (evidence.measured)
+    {
+        char line[160];
+        std::snprintf(line, sizeof(line), "CONFIDENCE %s %d %d %d %d %d %d", id.c_str(),
+                      evidence.runs, evidence.ballRuns, int(evidence.best * 100),
+                      evidence.firstMs, evidence.lastMs, evidence.movePx);
+        send(line);
+    }
+}
+
+// Green or red lights for kNotifyMs; yellow stays on until a decision.
 static void showLeds(leds::Color color, long long nowMs)
 {
     leds::show(color);
@@ -108,52 +147,98 @@ static void showLeds(leds::Color color, long long nowMs)
     ledOffAt = nowMs + kNotifyMs;
 }
 
-static void startEvent(Source source, long long triggerMs, long long nowMs)
+static void await(const std::string& reason, long long nowMs)
 {
-    current = State::Review;
-    currentId = session + "-" + std::to_string(++eventCount);
-    sources = {source};
-    eventStartMs = nowMs;
-
-    replay::begin(currentId, triggerMs);
-    lastReplay.clear();
-    lastReplayFrame = nullptr;
-
-    showLeds(leds::Color::Off, nowMs);
-    sendEvent();
-
-    cameraEvidenceState.clear();
-    cameraReplayState.clear();
-
-    if (captureHook)
-    {
-        cameraEvidenceState = cameraReplayState = "pending";
-        sendCamera();
-        captureHook(currentId);
-    }
-}
-
-static void monitor()
-{
-    current = State::Monitoring;
-    currentId.clear();
-    replay::clear();
-}
-
-static void reject(long long nowMs)
-{
-    monitor();
-    showLeds(leds::Color::Red, nowMs);
+    current = State::Awaiting;
+    awaitingReason = reason;
+    showLeds(leds::Color::Yellow, nowMs);
+    send("AWAITING " + currentId + " " + reason);
 }
 
 static void goal(long long nowMs)
 {
     current = State::Goal;
     currentId.clear();
-    replay::clear();
-    goalUntil = nowMs + kNotifyMs;
+    notifyUntil = nowMs + kNotifyMs;
     showLeds(leds::Color::Green, nowMs);
-    buzzer::chime();
+    buzzer::whistle();
+}
+
+static void reject(long long nowMs)
+{
+    current = State::NoGoal;
+    currentId.clear();
+    notifyUntil = nowMs + kNotifyMs;
+    showLeds(leds::Color::Red, nowMs);
+}
+
+// Only confident, event-correlated camera evidence on an IR event is a goal.
+// No ball is never a "no goal": anything uncertain goes to the referee.
+static void useEvidence(long long nowMs)
+{
+    const std::string& r = evidence.result;
+
+    if (r == "confident")
+    {
+        autoId = currentId;
+        autoSources = sourceList();
+        autoAcknowledged = autoCorrected = false;
+        send("AUTO " + autoId + " " + autoSources);
+        goal(nowMs);   // the replay stays loaded for the referee
+    }
+    else if (r == "none" || r == "missed")
+        await("no_ball", nowMs);
+    else if (r == "low")
+        await("low_confidence", nowMs);
+    else if (r == "stationary")
+        await("ball_not_moving", nowMs);
+    else if (r == "insufficient")
+        await("insufficient", nowMs);
+    else if (r == "seen")
+        await("unverified", nowMs);
+    else if (r == "ignored")
+        await("camera_busy", nowMs);
+    else
+        await("camera_unavailable", nowMs);
+}
+
+static void startEvent(Source source, long long triggerMs, long long nowMs)
+{
+    currentId = session + "-" + std::to_string(++eventCount);
+    sources = {source};
+    manualEvent = source == Source::Manual;
+    eventStartMs = nowMs;
+    viewing = false;
+
+    replay::begin(currentId, triggerMs);
+    lastReplay.clear();
+    lastReplayFrame = nullptr;
+
+    evidence = goalcam::Evidence();
+    replayState.clear();
+    current = State::Evaluating;
+    sendEvent();
+
+    bool cameraOk = false;
+
+    if (captureHook)
+    {
+        replayState = "pending";
+        cameraOk = captureHook(currentId, int(nowMs - triggerMs));
+
+        if (!cameraOk)
+            evidence.result = replayState = "unavailable";
+
+        sendCamera(currentId);
+        cameraOk = cameraOk && cameraStatus == "yolo";
+    }
+
+    if (manualEvent)
+        await("manual", nowMs);
+    else if (!cameraOk)
+        await("camera_unavailable", nowMs);
+    else
+        showLeds(leds::Color::Off, nowMs);
 }
 
 void init(SendText text, SendFrame frame, int liveFps)
@@ -170,7 +255,11 @@ void init(SendText text, SendFrame frame, int liveFps)
         std::chrono::system_clock::now().time_since_epoch()).count()) + suffix;
 
     lastStatus.clear();
-    monitor();
+    current = State::Monitoring;
+    currentId.clear();
+    autoId.clear();
+    viewing = false;
+    replay::clear();
     showLeds(leds::Color::Off, 0);
 }
 
@@ -183,24 +272,30 @@ void resync()
     lastReplayFrame = nullptr;
     lastLiveMs = -1000000;
 
-    if (current == State::Review)
+    if (reviewing())
     {
         sendEvent();
-        if (!cameraEvidenceState.empty())
-            sendCamera();
+        if (!replayState.empty())
+            sendCamera(currentId);
+        if (current == State::Awaiting)
+            send("AWAITING " + currentId + " " + awaitingReason);
     }
+
+    // An automatic goal sent while the server was away is sent again.
+    if (!autoId.empty() && !autoAcknowledged)
+        send("AUTO " + autoId + " " + autoSources);
 }
 
 void detected(Source source, long long triggerMs, long long nowMs)
 {
     std::lock_guard<std::mutex> lock(mutex);
 
-    if (current == State::Monitoring)
+    // The camera alone never opens an event; it can only support one.
+    if (current == State::Monitoring && source != Source::Camera)
     {
         startEvent(source, triggerMs, nowMs);
     }
-    else if (current == State::Review &&
-             nowMs - eventStartMs <= kEvidenceWindowMs &&
+    else if (reviewing() && nowMs - eventStartMs <= kCorroborationMs &&
              std::find(sources.begin(), sources.end(), source) == sources.end())
     {
         sources.push_back(source);
@@ -208,41 +303,42 @@ void detected(Source source, long long triggerMs, long long nowMs)
     }
 }
 
-void setCaptureHook(std::function<void(const std::string&)> hook)
+void setCaptureHook(CaptureHook hook)
 {
     std::lock_guard<std::mutex> lock(mutex);
     captureHook = hook;
 }
 
-static void sendCamera()
-{
-    send("CAMERA " + currentId + " " + cameraEvidenceState + " " + cameraReplayState);
-}
-
-void cameraEvidence(const std::string& eventId, const std::string& evidence, const std::string& replayState)
+void cameraEvidence(const std::string& eventId, const goalcam::Evidence& update,
+                    const std::string& replayUpdate, long long nowMs)
 {
     std::lock_guard<std::mutex> lock(mutex);
 
-    if (current != State::Review || eventId != currentId || cameraEvidenceState.empty())
+    if (!reviewing() || eventId != currentId || replayState.empty())
         return;
 
-    cameraEvidenceState = evidence;
-    if (cameraReplayState != "ready")
-        cameraReplayState = replayState;
-    sendCamera();
+    evidence = update;
+    if (replayState != "ready")
+        replayState = replayUpdate;
+    sendCamera(currentId);
+
+    // Late evidence only updates the dashboard once the referee has the event.
+    if (current == State::Evaluating && evidence.result != "pending")
+        useEvidence(nowMs);
 }
 
 void cameraClip(const std::string& eventId, std::vector<camera::FramePtr> frames, int fps)
 {
     std::lock_guard<std::mutex> lock(mutex);
 
-    if (current != State::Review || eventId != currentId || cameraEvidenceState.empty())
-        return;
+    // An automatic goal's clip usually arrives after the decision.
+    bool forCurrent = reviewing() && eventId == currentId && !replayState.empty();
+    bool forAuto = !eventId.empty() && eventId == autoId && replay::status().eventId == autoId;
 
-    if (replay::load(eventId, std::move(frames), fps))
+    if ((forCurrent || forAuto) && replay::load(eventId, std::move(frames), fps))
     {
-        cameraReplayState = "ready";
-        sendCamera();
+        replayState = "ready";
+        sendCamera(eventId);
     }
 }
 
@@ -251,7 +347,7 @@ void cameraFrame(const camera::FramePtr& frame)
     std::lock_guard<std::mutex> lock(mutex);
 
     // The dashboard shows the replay instead of live video during a review.
-    if (current == State::Review || frame->timeMs - lastLiveMs < liveIntervalMs)
+    if (reviewing() || viewing || frame->timeMs - lastLiveMs < liveIntervalMs)
         return;
 
     lastLiveMs = frame->timeMs;
@@ -270,6 +366,32 @@ void setIrStatus(const std::string& status)
     irStatus = status;
 }
 
+static void decision(const std::string& id, const std::string& result, long long nowMs)
+{
+    if (reviewing() && id == currentId)
+    {
+        if (result == "GOAL")
+            goal(nowMs);
+        else if (result == "NO_GOAL")
+            reject(nowMs);
+        return;
+    }
+
+    // The server confirms the latest automatic goal, or corrects it once.
+    if (id.empty() || id != autoId)
+        return;
+
+    autoAcknowledged = true;
+
+    if (result == "NO_GOAL" && !autoCorrected)
+    {
+        autoCorrected = true;
+        viewing = false;
+        if (!reviewing())
+            reject(nowMs);
+    }
+}
+
 void message(const std::string& line, long long nowMs)
 {
     std::lock_guard<std::mutex> lock(mutex);
@@ -280,7 +402,7 @@ void message(const std::string& line, long long nowMs)
 
     if (command == "REVIEW")
     {
-        if (current == State::Review)
+        if (reviewing())
             sendEvent();
         else
             startEvent(Source::Manual, nowMs, nowMs);
@@ -289,16 +411,27 @@ void message(const std::string& line, long long nowMs)
     {
         std::string id, result;
         in >> id >> result;
-
-        if (current != State::Review || id != currentId)
-            return;
-
-        if (result == "GOAL")
-            goal(nowMs);
-        else if (result == "NO_GOAL")
-            reject(nowMs);
+        decision(id, result, nowMs);
     }
-    else if (command == "REPLAY" && current == State::Review)
+    else if (command == "VIEW")
+    {
+        // Replays the latest automatic goal while monitoring; "VIEW -" ends it.
+        std::string id;
+        in >> id;
+
+        if (id == "-")
+        {
+            viewing = false;
+            replay::setPlaying(false);
+        }
+        else if (!reviewing() && !id.empty() && id == autoId && replay::status().eventId == autoId)
+        {
+            viewing = true;
+            lastReplay.clear();
+            lastReplayFrame = nullptr;
+        }
+    }
+    else if (command == "REPLAY" && (reviewing() || viewing))
     {
         std::string action;
         int index = 0;
@@ -323,7 +456,7 @@ void turn(int step)
 {
     std::lock_guard<std::mutex> lock(mutex);
 
-    if (current == State::Review)
+    if (reviewing() || viewing)
         step > 0 ? replay::next() : replay::previous();
 }
 
@@ -331,7 +464,7 @@ void press()
 {
     std::lock_guard<std::mutex> lock(mutex);
 
-    if (current == State::Review)
+    if (reviewing() || viewing)
         replay::togglePlayback();
 }
 
@@ -341,10 +474,13 @@ void tick(long long nowMs)
 
     replay::tick(nowMs);
 
-    if (current == State::Goal && nowMs >= goalUntil)
-        monitor();
+    if (current == State::Evaluating && nowMs - eventStartMs >= kEvidenceTimeoutMs)
+        await("timeout", nowMs);
 
-    if (ledColor != leds::Color::Off && nowMs >= ledOffAt)
+    if ((current == State::Goal || current == State::NoGoal) && nowMs >= notifyUntil)
+        current = State::Monitoring;
+
+    if ((ledColor == leds::Color::Green || ledColor == leds::Color::Red) && nowMs >= ledOffAt)
         showLeds(leds::Color::Off, nowMs);
 
     std::string status = std::string("STATUS ") + stateName(current) + " " +
@@ -358,7 +494,7 @@ void tick(long long nowMs)
         lastStatusMs = nowMs;
     }
 
-    if (current != State::Review)
+    if (!reviewing() && !viewing)
         return;
 
     replay::Status rs = replay::status();

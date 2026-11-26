@@ -175,13 +175,17 @@ static int testLeds()
     ok &= leds::show(leds::Color::Green);
     sleepMs(2000);
 
+    std::cout << "Yellow LED (" << pins::kLedYellow << ") on for 2 s\n";
+    ok &= leds::show(leds::Color::Yellow);
+    sleepMs(2000);
+
     std::cout << "Red LED (" << pins::kLedRed << ") on for 2 s\n";
     ok &= leds::show(leds::Color::Red);
     sleepMs(2000);
 
     ok &= leds::show(leds::Color::Off);
     leds::cleanup();
-    std::cout << "Both LEDs off\n";
+    std::cout << "All LEDs off\n";
     return ok ? 0 : 1;
 }
 
@@ -193,8 +197,8 @@ static int testBuzzer()
         return 1;
     }
 
-    std::cout << "Playing the goal chime once\n";
-    buzzer::chime();
+    std::cout << "Playing the referee whistle once (PIP - PIP - PIIIIIP)\n";
+    buzzer::whistle();
 
     while (buzzer::active())
         sleepMs(10);
@@ -242,8 +246,8 @@ static void usage()
         "  --stream-port N       its MJPEG web port shown on the dashboard (default 8080)\n"
         "  --no-camera           run without any camera\n"
         "  --check-avi FILE      check that a goal_cam.py replay clip can be read, then exit\n"
-        "  --test-leds           light green, then red, for 2 s each and exit\n"
-        "  --test-buzzer         play the goal chime once and exit\n"
+        "  --test-leds           light green, yellow, then red, for 2 s each and exit\n"
+        "  --test-buzzer         play the goal whistle once and exit\n"
         "  --test-encoder        print encoder turns and presses until Ctrl+C\n"
         "\n"
         "Built-in test camera instead of goal_cam.py (never use both on one device):\n"
@@ -428,16 +432,21 @@ int main(int argc, char* argv[])
     {
         goalcam::Callbacks callbacks;
         callbacks.status = controller::setCameraStatus;
-        callbacks.evidence = controller::cameraEvidence;
+        callbacks.evidence = [](const std::string& id, const goalcam::Evidence& e,
+                                const std::string& replay) {
+            controller::cameraEvidence(id, e, replay, nowMs());
+        };
         callbacks.clip = controller::cameraClip;
         callbacks.stats = [](double fps, double ms, bool ball) {
             network::send("CAMSTAT " + std::to_string(int(fps + 0.5)) + " " +
                           std::to_string(int(ms + 0.5)) + " " + (ball ? "1" : "0"));
         };
 
-        controller::setCaptureHook([](const std::string& id) {
-            if (!goalcam::capture(id))
+        controller::setCaptureHook([](const std::string& id, int breakOffsetMs) {
+            bool sent = goalcam::capture(id, breakOffsetMs);
+            if (!sent)
                 std::cerr << "Could not send the replay trigger to goal_cam.py\n";
+            return sent;
         });
         goalcam::start(goalCam, callbacks);
     }

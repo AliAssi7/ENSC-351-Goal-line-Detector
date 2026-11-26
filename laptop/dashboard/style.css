@@ -1,7 +1,8 @@
 /* True Goal referee dashboard — proposal v2.
    Accent colours are sampled from true-goal.png. State-dependent styling only
    reads state that script.js already sets (disabled buttons, .ok/.bad, [hidden]).
-   Status colours are green and red only; orange and blue are branding. */
+   Status colours: green (goal), yellow (awaiting decision), red (no goal);
+   orange and blue are branding. */
 :root {
     --page: #f2f3f5;
     --surface: #ffffff;
@@ -15,6 +16,7 @@
     --blue-dark: #0a5cc0;
     --ok: #15803d;
     --bad: #c62828;
+    --wait: #b7791f;
     --neutral: #b4b8c0;
     /* dark camera monitor */
     --panel: #111317;
@@ -81,6 +83,10 @@ header {
 
 .bad {
     color: var(--bad);
+}
+
+.wait {
+    color: var(--wait);
 }
 
 .system-status {
@@ -242,7 +248,7 @@ button:disabled {
     line-height: 1;
 }
 
-/* Status dots: grey while neutral, green for .ok, red for .bad. */
+/* Status dots: grey while neutral, green for .ok, yellow for .wait, red for .bad. */
 #irStatus::before,
 #cameraStatus::before,
 #reviewStatus::before {
@@ -266,6 +272,10 @@ button:disabled {
 #cameraStatus.bad::before,
 #reviewStatus.bad::before {
     background: var(--bad);
+}
+
+#reviewStatus.wait::before {
+    background: #eab308;
 }
 
 /* Cards */
@@ -485,6 +495,10 @@ button:disabled {
     display: flex;
     flex-direction: column;
     gap: 10px;
+}
+
+#autoActions {
+    margin-top: 10px;
 }
 
 .review-actions button {

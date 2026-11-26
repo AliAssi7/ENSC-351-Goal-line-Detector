@@ -19,19 +19,31 @@ using Clock = std::chrono::steady_clock;
 using std::chrono::microseconds;
 using std::chrono::milliseconds;
 
-// Goal chime: tune these after listening to the buzzer.
-// A note with frequency 0 is a silence.
-struct Note {
-    int frequencyHz;
+// --- All buzzer settings ---------------------------------------------------
+// Goal notification: a referee's full-time whistle, PIP - PIP - PIIIIIP,
+// all blasts at the same pitch.
+struct Step {
+    bool on;
     int ms;
 };
 
-static const Note kChime[] = {
-    {1200, 150},
-    {0,     80},
-    {1600, 200},
+static const Step kWhistle[] = {
+    {true,  200},
+    {false, 150},
+    {true,  200},
+    {false, 150},
+    {true,  600},
 };
-static const int kDutyPercent = 15;   // Lower is softer
+
+// Passive buzzer (installed): a square wave at this pitch and duty cycle.
+// Too low a duty cycle makes the buzzer go silent.
+static const int kFrequencyHz = 2000;
+static const int kDutyPercent = 25;
+
+// Set to true for an active buzzer: the pin is just held high during each
+// blast, and the buzzer makes its own pitch.
+static const bool kActiveBuzzer = false;
+// ---------------------------------------------------------------------------
 
 static int fd = -1;
 static std::atomic<bool> running{false};
@@ -52,9 +64,9 @@ static void setPin(int value)
 
 // GPIO25 has no hardware PWM. The short high phase is a busy-wait so a late
 // wake-up cannot stretch it; the rest of each period sleeps.
-static void tone(int frequencyHz, Clock::time_point end)
+static void squareWave(Clock::time_point end)
 {
-    const microseconds period(1000000 / frequencyHz);
+    const microseconds period(1000000 / kFrequencyHz);
     const microseconds high = period * kDutyPercent / 100;
     Clock::time_point next = Clock::now();
 
@@ -75,20 +87,32 @@ static void tone(int frequencyHz, Clock::time_point end)
     setPin(0);
 }
 
+// Wakes early if cleanup() runs.
+static void waitUntil(Clock::time_point end)
+{
+    std::unique_lock<std::mutex> lock(mutex);
+    wakeup.wait_until(lock, end, [] { return !running; });
+}
+
 static void play()
 {
-    for (const Note& note : kChime)
+    for (const Step& step : kWhistle)
     {
-        Clock::time_point end = Clock::now() + milliseconds(note.ms);
+        Clock::time_point end = Clock::now() + milliseconds(step.ms);
 
-        if (note.frequencyHz > 0)
+        if (step.on && kActiveBuzzer)
         {
-            tone(note.frequencyHz, end);
+            setPin(1);
+            waitUntil(end);
+            setPin(0);
+        }
+        else if (step.on)
+        {
+            squareWave(end);
         }
         else
         {
-            std::unique_lock<std::mutex> lock(mutex);
-            wakeup.wait_until(lock, end, [] { return !running; });
+            waitUntil(end);
         }
 
         if (!running)
@@ -136,11 +160,11 @@ bool init()
     return true;
 }
 
-void chime()
+void whistle()
 {
     std::lock_guard<std::mutex> lock(mutex);
 
-    // A chime already playing is not restarted, so repeated calls cannot overlap.
+    // A whistle already playing is not restarted, so repeated calls cannot overlap.
     if (!running || sounding)
         return;
 

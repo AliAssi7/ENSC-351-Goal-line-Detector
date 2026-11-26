@@ -3,13 +3,13 @@
 
 namespace leds {
 
-enum class Color { Off, Green, Red };
+enum class Color { Off, Green, Yellow, Red };
 
-// Opens both LEDs (off). Returns false if either could not be opened;
-// the other one still works.
+// Opens all LEDs (off). Returns false if any could not be opened;
+// the others still work.
 bool init();
 
-// Lights only the given LED, so both are never on together.
+// Lights only the given LED, so two are never on together.
 // Returns false if a GPIO write failed.
 bool show(Color color);
 

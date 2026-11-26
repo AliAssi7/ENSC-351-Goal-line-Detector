@@ -13,9 +13,10 @@ struct Led {
     bool failed;
 };
 
-static Led ledList[2] = {
-    {pins::kLedGreen, Color::Green, -1, false},
-    {pins::kLedRed,   Color::Red,   -1, false}
+static Led ledList[3] = {
+    {pins::kLedGreen,  Color::Green,  -1, false},
+    {pins::kLedYellow, Color::Yellow, -1, false},
+    {pins::kLedRed,    Color::Red,    -1, false}
 };
 
 bool init()
@@ -41,7 +42,7 @@ bool show(Color color)
 {
     bool ok = true;
 
-    // Turn the other LED off before lighting the new one.
+    // Turn the other LEDs off before lighting the new one.
     for (int pass = 0; pass < 2; ++pass)
     {
         for (Led& led : ledList)

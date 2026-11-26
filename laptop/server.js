@@ -6,9 +6,13 @@ const path = require("path");
 
 const ID_PATTERN = /^[A-Za-z0-9-]{1,40}$/;
 const SOURCES = ["camera", "ir", "manual"];
-const BOARD_STATES = ["monitoring", "review", "goal"];
+const BOARD_STATES = ["monitoring", "evaluating", "awaiting", "goal", "nogoal"];
 const CAMERA_STATES = ["yolo", "starting", "live", "file", "sim", "offline", "disabled"];
-const CAMERA_EVIDENCE = ["pending", "seen", "missed", "ignored", "unavailable"];
+const CAMERA_EVIDENCE = ["pending", "confident", "stationary", "low", "none", "insufficient",
+    "seen", "missed", "ignored", "unavailable"];
+// Why an event waits for the referee.
+const AWAIT_REASONS = ["manual", "no_ball", "low_confidence", "ball_not_moving", "insufficient", "unverified",
+    "camera_busy", "camera_unavailable", "timeout"];
 const CAMERA_REPLAY = ["pending", "ready", "unavailable"];
 const IR_STATES = ["ok", "degraded", "error", "disabled", "offline"];
 const REPLAY_ACTIONS = { next: "NEXT", prev: "PREV", play: "PLAY", pause: "PAUSE" };
@@ -96,6 +100,7 @@ function startServer({ httpPort = 3000, boardPort = 4000, host = "127.0.0.1",
         goals: 0,
         history: [],
         replay: null,
+        viewing: null,   // id of the automatic goal whose replay is being shown
         line: null
     };
 
@@ -150,11 +155,121 @@ function startServer({ httpPort = 3000, boardPort = 4000, host = "127.0.0.1",
         }
     }
 
+    // phase: "evaluating" while the board checks the camera, then "awaiting"
+    // the referee. Manual events (Simulate Event) always await the referee.
     function openEvent(id, sources) {
-        state.pending = { id, number: nextNumber++, sources, camera: null, cameraReplay: null, time: Date.now() };
+        state.pending = {
+            id, number: nextNumber++, sources, manual: sources[0] === "manual",
+            phase: "evaluating", reason: null, camera: null, cameraReplay: null,
+            confidence: null, time: Date.now()
+        };
         state.replay = null;
+        state.viewing = null;
         replayFrame = null;
         broadcast();
+    }
+
+    // The event whose replay the dashboard shows.
+    function replayId() {
+        return state.pending ? state.pending.id : state.viewing;
+    }
+
+    function remember(id, result) {
+        decided.set(id, result);
+        if (decided.size > MAX_DECIDED) {
+            decided.delete(decided.keys().next().value);
+        }
+    }
+
+    function record(event, decision, auto) {
+        state.history.unshift({
+            id: event.id,
+            number: event.number,
+            decision,
+            auto,
+            manual: !!event.manual,
+            corrected: false,
+            reason: event.reason || null,
+            sources: event.sources,
+            camera: event.camera || null,
+            cameraReplay: event.cameraReplay || null,
+            confidence: event.confidence || null,
+            detected: event.time || Date.now(),
+            time: Date.now()
+        });
+
+        if (decision === "GOAL") {
+            state.goals++;
+        }
+    }
+
+    function latestAutoGoal() {
+        const entry = state.history.find((e) => e.auto);
+        return entry && entry.decision === "GOAL" && !entry.corrected ? entry : null;
+    }
+
+    // The board decided a goal by itself. Recorded once, and acknowledged
+    // with DECISION so the board stops resending it.
+    function autoGoal(id, sources) {
+        if (!decided.has(id)) {
+            const event = state.pending && state.pending.id === id
+                ? state.pending
+                : { id, number: nextNumber++, sources, time: Date.now() };
+
+            event.sources = sources;
+            record(event, "GOAL", true);
+            remember(id, "GOAL");
+
+            if (state.pending && state.pending.id === id) {
+                state.pending = null;
+                state.replay = null;
+                replayFrame = null;
+            }
+            broadcast();
+        }
+
+        sendToBoard(`DECISION ${id} ${decided.get(id)}`);
+    }
+
+    // The referee overturns the latest automatic goal: same history entry,
+    // one goal less, red LED on the board.
+    function correct(id) {
+        const entry = latestAutoGoal();
+
+        if (!entry || entry.id !== id || state.pending) {
+            return;
+        }
+
+        entry.decision = "NO GOAL";
+        entry.corrected = true;
+        entry.time = Date.now();
+        state.goals--;
+        remember(id, "NO_GOAL");
+        sendToBoard(`DECISION ${id} NO_GOAL`);
+        closeView();
+        broadcast();
+    }
+
+    function view(id) {
+        const entry = latestAutoGoal();
+
+        if (entry && entry.id === id && !state.pending && board) {
+            state.viewing = id;
+            state.replay = null;
+            replayFrame = null;
+            sendToBoard(`VIEW ${id}`);
+            broadcast();
+        }
+    }
+
+    function closeView() {
+        if (state.viewing) {
+            state.viewing = null;
+            state.replay = null;
+            replayFrame = null;
+            sendToBoard("VIEW -");
+            broadcast();
+        }
     }
 
     // Reviews always run on the board, so the LEDs, buzzer and replay are real.
@@ -164,39 +279,32 @@ function startServer({ httpPort = 3000, boardPort = 4000, host = "127.0.0.1",
         }
     }
 
+    // The referee's decision, only once the event is awaiting it.
     function decide(id, result) {
         const pending = state.pending;
 
-        if (!pending || id !== pending.id || !["GOAL", "NO GOAL"].includes(result)) {
+        if (!pending || id !== pending.id || pending.phase !== "awaiting" ||
+            !["GOAL", "NO GOAL"].includes(result)) {
             return;
         }
 
-        state.history.unshift({
-            id: pending.id,
-            number: pending.number,
-            decision: result,
-            sources: pending.sources,
-            camera: pending.camera,
-            cameraReplay: pending.cameraReplay,
-            detected: pending.time,
-            time: Date.now()
-        });
-
-        if (result === "GOAL") {
-            state.goals++;
-        }
+        record(pending, result, false);
 
         // Kept by id, so a board that reconnects mid-review is told again.
-        decided.set(id, result === "GOAL" ? "GOAL" : "NO_GOAL");
-        if (decided.size > MAX_DECIDED) {
-            decided.delete(decided.keys().next().value);
-        }
+        remember(id, result === "GOAL" ? "GOAL" : "NO_GOAL");
         sendToBoard(`DECISION ${id} ${decided.get(id)}`);
 
         state.pending = null;
         state.replay = null;
         replayFrame = null;
         broadcast();
+    }
+
+    function findEvent(id) {
+        if (state.pending && state.pending.id === id) {
+            return state.pending;
+        }
+        return state.history.find((e) => e.id === id && e.auto) || null;
     }
 
     function handleBoardLine(line, socket) {
@@ -237,10 +345,34 @@ function startServer({ httpPort = 3000, boardPort = 4000, host = "127.0.0.1",
 
                 broadcast();
             }
+        } else if (type === "AWAITING" && parts.length === 3) {
+            if (state.pending && state.pending.id === parts[1] && AWAIT_REASONS.includes(parts[2])) {
+                state.pending.phase = "awaiting";
+                state.pending.reason = parts[2];
+                broadcast();
+            }
+        } else if (type === "AUTO" && parts.length === 3 && ID_PATTERN.test(parts[1])) {
+            const sources = [...new Set(parts[2].split(","))];
+
+            if (sources.every((s) => SOURCES.includes(s)) && sources.includes("ir") &&
+                !sources.includes("manual")) {
+                autoGoal(parts[1], sources);
+            }
+        } else if (type === "CONFIDENCE" && parts.length === 8) {
+            // CONFIDENCE <id> <runs> <ball runs> <best %> <first ms> <last ms> <ball movement px>
+            const numbers = parseInts(parts.slice(2));
+            const target = findEvent(parts[1]);
+
+            if (numbers && target && isInt(numbers[0], 0, 1000) && isInt(numbers[1], 0, numbers[0]) &&
+                isInt(numbers[2], 0, 100)) {
+                const [runs, ballRuns, best, firstMs, lastMs, movePx] = numbers;
+                target.confidence = { runs, ballRuns, best, firstMs, lastMs, movePx };
+                broadcast();
+            }
         } else if (type === "REPLAY" && parts.length === 6) {
             const numbers = parseInts(parts.slice(2));
 
-            if (!numbers || !state.pending || state.pending.id !== parts[1]) {
+            if (!numbers || !replayId() || replayId() !== parts[1]) {
                 return;
             }
 
@@ -251,10 +383,12 @@ function startServer({ httpPort = 3000, boardPort = 4000, host = "127.0.0.1",
                 broadcast();
             }
         } else if (type === "CAMERA" && parts.length === 4) {
-            if (state.pending && state.pending.id === parts[1] &&
-                CAMERA_EVIDENCE.includes(parts[2]) && CAMERA_REPLAY.includes(parts[3])) {
-                state.pending.camera = parts[2];
-                state.pending.cameraReplay = parts[3];
+            // Also updates a decided automatic goal whose replay arrives late.
+            const target = findEvent(parts[1]);
+
+            if (target && CAMERA_EVIDENCE.includes(parts[2]) && CAMERA_REPLAY.includes(parts[3])) {
+                target.camera = parts[2];
+                target.cameraReplay = parts[3];
                 broadcast();
             }
         } else if (type === "STREAM" && (parts.length === 2 || parts.length === 3)) {
@@ -313,7 +447,7 @@ function startServer({ httpPort = 3000, boardPort = 4000, host = "127.0.0.1",
         if (header.kind === "LIVE") {
             liveFrame = frame;
             io.emit("live", frame);
-        } else if (state.pending && state.pending.id === header.id) {
+        } else if (replayId() && replayId() === header.id) {
             replayFrame = frame;
             io.emit("replayFrame", frame);
         }
@@ -338,8 +472,22 @@ function startServer({ httpPort = 3000, boardPort = 4000, host = "127.0.0.1",
             }
         });
 
+        socket.on("correct", (data) => {
+            if (data && typeof data.id === "string") {
+                correct(data.id);
+            }
+        });
+
+        socket.on("view", (data) => {
+            if (data && typeof data.id === "string") {
+                view(data.id);
+            } else {
+                closeView();
+            }
+        });
+
         socket.on("replay", (data) => {
-            if (!data || !state.pending) {
+            if (!data || !replayId()) {
                 return;
             }
 
@@ -434,6 +582,11 @@ function startServer({ httpPort = 3000, boardPort = 4000, host = "127.0.0.1",
                 board = null;
                 liveFrame = null;
                 state.board = { connected: false, state: null, camera: null, ir: null, stream: null, cameraStats: null };
+                if (state.viewing) {
+                    state.viewing = null;
+                    state.replay = null;
+                    replayFrame = null;
+                }
                 console.log("BeagleY-AI disconnected");
                 broadcast();
             }

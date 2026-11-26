@@ -440,9 +440,10 @@ struct Sent {
 
 static Sent sent;
 
-static void checkLeds(int green, int red)
+static void checkLeds(int green, int yellow, int red)
 {
     CHECK(gpio_mock::value("GPIO5") == green);
+    CHECK(gpio_mock::value("GPIO6") == yellow);
     CHECK(gpio_mock::value("GPIO26") == red);
 }
 
@@ -463,7 +464,7 @@ static long long feedFrames(long long from, long long to)
     return to;
 }
 
-static void testController()
+static void startController()
 {
     gpio_mock::reset();
     CHECK(leds::init());
@@ -478,10 +479,37 @@ static void testController()
             sent.frames.push_back({slot, header});
         },
         8);
+    controller::setCaptureHook(nullptr);
+}
 
-    // Both LEDs stay off at startup and while monitoring.
-    checkLeds(0, 0);
-    CHECK(controller::state() == controller::State::Monitoring);
+// Each whistle is three blasts; waits for any whistle in progress to finish.
+static int blasts()
+{
+    bool waited = false;
+    for (int i = 0; i < 400 && buzzer::active(); ++i, waited = true)
+        sleepMs(5);
+    if (waited)
+        sleepMs(30);   // a gap, so the mock counts the next whistle's blasts separately
+    return int(gpio_mock::burstLog("GPIO25").size());
+}
+
+static goalcam::Evidence evidenceOf(const char* result)
+{
+    goalcam::Evidence e;
+    e.result = result;
+    return e;
+}
+
+using controller::State;
+
+// Manual reviews, LEDs, buzzer and replay controls, without the AI camera.
+static void testController()
+{
+    startController();
+
+    // All LEDs off at startup and while monitoring.
+    checkLeds(0, 0, 0);
+    CHECK(controller::state() == State::Monitoring);
 
     // Live frames are throttled to the preview rate.
     feedFrames(0, 66 * 15);
@@ -500,214 +528,448 @@ static void testController()
     controller::tick(1010);
     CHECK(sent.count("REPLAY") == 0);
 
-    // Camera event.
+    // The camera alone never opens an event.
     sent.clear();
     controller::detected(controller::Source::Camera, 990, 1000);
+    CHECK(controller::state() == State::Monitoring && controller::eventId().empty());
+    CHECK(sent.count("EVENT") == 0);
+    checkLeds(0, 0, 0);
+
+    // Simulate Event: Awaiting Decision with the yellow LED at once.
+    controller::message("REVIEW", 1000);
     std::string id = controller::eventId();
-    CHECK(!id.empty());
-    CHECK(sent.text.size() == 1 && sent.text[0] == "EVENT " + id + " camera");
-    checkLeds(0, 0);
+    CHECK(!id.empty() && controller::state() == State::Awaiting);
+    CHECK(sent.last("EVENT") == "EVENT " + id + " manual");
+    CHECK(sent.last("AWAITING") == "AWAITING " + id + " manual");
+    checkLeds(0, 1, 0);
+
+    // Repeated clicks do not open another review.
+    controller::message("REVIEW", 1010);
+    CHECK(controller::eventId() == id && sent.count("EVENT " + id) == 2);
 
     // No live frames during the review; post-event frames join the replay.
+    sent.frames.clear();
     feedFrames(1056, 1056 + 66 * 5);
     CHECK(sent.frames.empty());
 
     controller::tick(1500);
-    CHECK(sent.last("STATUS") == "STATUS review sim offline " + id);
+    CHECK(sent.last("STATUS") == "STATUS awaiting sim offline " + id);
     CHECK(sent.last("REPLAY") == "REPLAY " + id + " 15 22 0 0");
     CHECK(sent.frames.size() == 1 && sent.frames[0].first == controller::ReplaySlot);
-    CHECK(startsWith(sent.frames[0].second, "FRAME REPLAY " + id + " 15 320 240"));
 
-    // IR evidence within the window joins the same event; repeats do not.
+    // An IR trigger joins the manual event but never makes it automatic.
     controller::detected(controller::Source::Ir, 900, 1900);
     controller::detected(controller::Source::Ir, 900, 2000);
-    controller::detected(controller::Source::Camera, 2000, 2000);
-    CHECK(sent.count("EVENT") == 2 && sent.last("EVENT") == "EVENT " + id + " camera,ir");
-    CHECK(controller::eventId() == id);
+    CHECK(sent.last("EVENT") == "EVENT " + id + " manual,ir");
+    CHECK(controller::state() == State::Awaiting && controller::eventId() == id);
 
-    // Encoder steps move the shared replay and send the new frame.
+    // Encoder steps and dashboard commands move the same replay.
     sent.clear();
     controller::turn(1);
     controller::tick(1600);
     CHECK(sent.last("REPLAY") == "REPLAY " + id + " 16 22 0 0");
     CHECK(sent.frames.size() == 1 && startsWith(sent.frames[0].second, "FRAME REPLAY " + id + " 16 "));
-
     for (int i = 0; i < 30; ++i)
         controller::turn(1);
     controller::tick(1610);
     CHECK(sent.last("REPLAY") == "REPLAY " + id + " 21 22 0 0");
-
-    // Dashboard commands act on the same replay.
+    controller::turn(-1);
+    controller::tick(1615);
+    CHECK(sent.last("REPLAY") == "REPLAY " + id + " 20 22 0 0");
     controller::message("REPLAY SEEK 3", 1620);
-    controller::tick(1620);
-    CHECK(sent.last("REPLAY") == "REPLAY " + id + " 3 22 0 0");
     controller::message("REPLAY SEEK 99", 1630);
     controller::message("REPLAY BOGUS", 1630);
-    controller::message("REPLAY SEEK", 1630);
     controller::tick(1630);
     CHECK(sent.last("REPLAY") == "REPLAY " + id + " 3 22 0 0");
-
     controller::press();
     controller::tick(1700);
     CHECK(sent.last("REPLAY") == "REPLAY " + id + " 4 22 1 0");
     controller::message("REPLAY PAUSE", 1750);
     controller::tick(1800);
     CHECK(sent.last("REPLAY") == "REPLAY " + id + " 4 22 0 0");
-    controller::message("REPLAY PLAY", 1810);
-    controller::tick(1820);
-    CHECK(sent.last("REPLAY") == "REPLAY " + id + " 5 22 1 0");
-    controller::message("REPLAY PAUSE", 1830);
 
-    // Reconnecting resends the event, status and replay frame.
+    // Reconnecting resends the pending event, the reason and the replay.
     sent.clear();
     controller::resync();
     controller::tick(1840);
-    CHECK(sent.count("EVENT " + id) == 1 && sent.count("STATUS") == 1 && sent.count("REPLAY") == 1);
-    CHECK(sent.frames.size() == 1);
+    CHECK(sent.count("EVENT " + id) == 1 && sent.count("AWAITING " + id + " manual") == 1);
+    CHECK(sent.count("STATUS") == 1 && sent.count("REPLAY") == 1 && sent.frames.size() == 1);
+
+    // Yellow stays on while the referee takes minutes over it.
+    controller::tick(1000 + 5 * 60 * 1000);
+    CHECK(controller::state() == State::Awaiting);
+    checkLeds(0, 1, 0);
+    CHECK(blasts() == 0);
 
     // Invalid and stale decisions are ignored.
-    controller::message("DECISION wrong-id GOAL", 1900);
-    controller::message("DECISION " + id + " MAYBE", 1900);
-    controller::message("DECISION", 1900);
-    controller::message("garbage", 1900);
-    CHECK(controller::state() == controller::State::Review);
-    checkLeds(0, 0);
+    long long t = 400000;
+    controller::message("DECISION wrong-id GOAL", t);
+    controller::message("DECISION " + id + " MAYBE", t);
+    controller::message("DECISION", t);
+    controller::message("garbage", t);
+    CHECK(controller::state() == State::Awaiting);
+    checkLeds(0, 1, 0);
 
-    // Confirmed goal: green for 3 s and the chime (two tones) once.
-    controller::message("DECISION " + id + " GOAL", 2000);
-    checkLeds(1, 0);
-    CHECK(controller::state() == controller::State::Goal);
-    CHECK(buzzer::active());
-    sleepMs(800);
-    CHECK(!buzzer::active() && gpio_mock::value("GPIO25") == 0);
+    // Confirm: yellow off, green for 3 s, the whistle once.
+    controller::message("DECISION " + id + " GOAL", t);
+    checkLeds(1, 0, 0);
+    CHECK(controller::state() == State::Goal && buzzer::active());
+    controller::message("DECISION " + id + " GOAL", t + 100);
+    controller::message("DECISION " + id + " NO_GOAL", t + 100);
+    checkLeds(1, 0, 0);
+    CHECK(blasts() == 3);
+    controller::tick(t + 2990);
+    checkLeds(1, 0, 0);
+    CHECK(controller::state() == State::Goal);
+    controller::tick(t + 3000);
+    checkLeds(0, 0, 0);
+    CHECK(controller::state() == State::Monitoring);
 
-    controller::message("DECISION " + id + " GOAL", 2100);
-    controller::message("DECISION " + id + " NO_GOAL", 2100);
-    controller::detected(controller::Source::Camera, 2100, 2100);
-    sleepMs(50);
-    CHECK(gpio_mock::bursts("GPIO25") == 2);
-    CHECK(controller::state() == controller::State::Goal);
-    checkLeds(1, 0);
-
-    controller::tick(3000);
-    controller::tick(4990);
-    CHECK(controller::state() == controller::State::Goal);
-    checkLeds(1, 0);
-    controller::tick(5000);
-    CHECK(controller::state() == controller::State::Monitoring);
-    checkLeds(0, 0);
-
-    // Manual review rejected: no sound, red for 3 s, then off.
-    sent.clear();
-    controller::message("REVIEW", 9000);
+    // Reject: yellow off, red for 3 s, no sound.
+    t += 10000;
+    controller::message("REVIEW", t);
     std::string manual = controller::eventId();
-    CHECK(manual != id && sent.last("EVENT") == "EVENT " + manual + " manual");
-    checkLeds(0, 0);
-    controller::message("REVIEW", 9010);
-    CHECK(controller::eventId() == manual && sent.count("EVENT") == 2);
-    controller::message("DECISION " + manual + " NO_GOAL", 9100);
-    checkLeds(0, 1);
-    CHECK(!buzzer::active());
-    controller::tick(12090);
-    checkLeds(0, 1);
-    controller::tick(12100);
-    checkLeds(0, 0);
+    CHECK(manual != id);
+    checkLeds(0, 1, 0);
+    controller::message("DECISION " + manual + " NO_GOAL", t + 100);
+    checkLeds(0, 0, 1);
+    CHECK(controller::state() == State::NoGoal && !buzzer::active());
+    controller::tick(t + 3090);
+    checkLeds(0, 0, 1);
+    controller::tick(t + 3100);
+    checkLeds(0, 0, 0);
+    CHECK(controller::state() == State::Monitoring && blasts() == 3);
 
-    // Sensor and camera faults are shown on the dashboard, not the LEDs.
+    // An IR event without the AI camera waits for the referee.
+    t += 10000;
+    controller::detected(controller::Source::Ir, t - 1000, t);
+    std::string ir = controller::eventId();
+    CHECK(controller::state() == State::Awaiting);
+    CHECK(sent.last("AWAITING") == "AWAITING " + ir + " camera_unavailable");
+    checkLeds(0, 1, 0);
+
+    // Sensor and camera faults do not change the LEDs.
     controller::setIrStatus("error");
     controller::setCameraStatus("offline");
-    controller::tick(14200);
-    checkLeds(0, 0);
+    controller::tick(t + 100);
+    checkLeds(0, 1, 0);
     controller::setIrStatus("ok");
     controller::setCameraStatus("sim");
-    controller::tick(14500);
-    checkLeds(0, 0);
-    CHECK(gpio_mock::bursts("GPIO25") == 2);
+    controller::message("DECISION " + ir + " NO_GOAL", t + 200);
+    controller::tick(t + 3300);
+    checkLeds(0, 0, 0);
 
-    // Late evidence for a closed event opens a new one instead.
-    controller::detected(controller::Source::Ir, 9200, 9200);
-    std::string late = controller::eventId();
-    CHECK(!late.empty() && late != manual);
-    controller::message("DECISION " + late + " NO_GOAL", 9300);
-
-    // Several goals in a row, each beeping once.
+    // Several manual goals in a row: each whistles once, with its own id.
     std::vector<std::string> ids;
-    long long now = 20000;
     for (int i = 0; i < 3; ++i)
     {
-        controller::detected(controller::Source::Ir, now - 1000, now);
+        t += 10000;
+        controller::message("REVIEW", t);
         ids.push_back(controller::eventId());
-        controller::message("DECISION " + ids.back() + " GOAL", now + 100);
-        sleepMs(1150);
-        controller::tick(now + 200);
-        controller::tick(now + 5300);
-        CHECK(controller::state() == controller::State::Monitoring);
-        now += 10000;
+        controller::message("DECISION " + ids.back() + " GOAL", t + 100);
+        blasts();
+        controller::tick(t + 3200);
+        CHECK(controller::state() == State::Monitoring);
     }
-    CHECK(gpio_mock::bursts("GPIO25") == 8);
+    CHECK(blasts() == 12);
     CHECK(ids[0] != ids[1] && ids[1] != ids[2]);
-    checkLeds(0, 0);
 
-    // A review can start while the goal LED is still lit: the LED goes off.
-    controller::detected(controller::Source::Camera, now, now);
-    controller::message("DECISION " + controller::eventId() + " GOAL", now);
-    controller::message("REVIEW", now + 100);
-    checkLeds(0, 0);
-
-    // Rejected, then a quick new review confirmed: the new LED gets its own 3 s.
-    controller::message("DECISION " + controller::eventId() + " NO_GOAL", now + 200);
-    checkLeds(0, 1);
-    controller::message("REVIEW", now + 500);
-    checkLeds(0, 0);
-    controller::message("DECISION " + controller::eventId() + " GOAL", now + 1000);
-    checkLeds(1, 0);
-    controller::tick(now + 3500);
-    checkLeds(1, 0);
-    controller::tick(now + 4000);
-    checkLeds(0, 0);
-    sleepMs(800);
-    now += 10000;
+    // A new review during the green notification: green off, yellow on.
+    t += 10000;
+    controller::message("REVIEW", t);
+    controller::message("DECISION " + controller::eventId() + " GOAL", t);
+    controller::message("REVIEW", t + 100);
+    checkLeds(0, 1, 0);
+    blasts();
 
     // Status heartbeat.
     sent.clear();
-    controller::tick(now + 200);
-    controller::tick(now + 300);
-    controller::tick(now + 1300);
+    controller::tick(t + 200);
+    controller::tick(t + 300);
+    controller::tick(t + 1300);
     CHECK(sent.count("STATUS") == 2);
 
+    // Shutdown while awaiting a decision: every LED and the buzzer off.
     buzzer::cleanup();
     leds::cleanup();
-    CHECK(!gpio_mock::isOpen("GPIO25") && !gpio_mock::isOpen("GPIO5"));
-    CHECK(gpio_mock::value("GPIO26") == 0);
+    checkLeds(0, 0, 0);
+    CHECK(gpio_mock::value("GPIO25") == 0);
+    CHECK(!gpio_mock::isOpen("GPIO25") && !gpio_mock::isOpen("GPIO5") && !gpio_mock::isOpen("GPIO6"));
 
     buzzer::cleanup();
     leds::cleanup();
-    buzzer::chime();
+    buzzer::whistle();
     leds::show(leds::Color::Red);
-    controller::detected(controller::Source::Camera, now, now);
 }
 
-static void waitForBuzzer()
+// IR events judged by camera evidence.
+static void testHybrid()
 {
-    sleepMs(20);
-    for (int i = 0; i < 300 && buzzer::active(); ++i)
-        sleepMs(5);
-    sleepMs(50);   // a gap, so the mock counts the next tone as a new burst
+    startController();
+    controller::setCameraStatus("yolo");
+
+    std::vector<std::pair<std::string, int>> captures;
+    bool cameraAnswers = true;
+    controller::setCaptureHook([&](const std::string& id, int offset) {
+        captures.push_back({id, offset});
+        return cameraAnswers;
+    });
+
+    // IR + confident, event-correlated detection: automatic goal.
+    long long t = 10000;
+    controller::detected(controller::Source::Ir, t - 1000, t);
+    std::string id = controller::eventId();
+    CHECK(captures.size() == 1 && captures[0].first == id && captures[0].second == 1000);
+    CHECK(controller::state() == State::Evaluating);
+    CHECK(sent.last("CAMERA") == "CAMERA " + id + " pending pending");
+    checkLeds(0, 0, 0);
+
+    // Repeated triggers during the evaluation stay in the same event.
+    controller::detected(controller::Source::Ir, t - 500, t + 500);
+    CHECK(controller::eventId() == id && sent.count("EVENT") == 1);
+
+    // Evidence for another event is ignored.
+    controller::cameraEvidence("other", evidenceOf("confident"), "pending", t + 1000);
+    CHECK(controller::state() == State::Evaluating);
+
+    goalcam::Evidence confident = evidenceOf("confident");
+    confident.measured = true;
+    confident.runs = 6;
+    confident.ballRuns = 3;
+    confident.best = 0.914;
+    confident.firstMs = -900;
+    confident.lastMs = 100;
+    controller::cameraEvidence(id, confident, "pending", t + 2000);
+    CHECK(controller::state() == State::Goal);
+    CHECK(sent.last("AUTO") == "AUTO " + id + " ir");
+    CHECK(sent.last("CAMERA") == "CAMERA " + id + " confident pending");
+    CHECK(sent.last("CONFIDENCE") == "CONFIDENCE " + id + " 6 3 91 -900 100 0");
+    checkLeds(1, 0, 0);
+    CHECK(blasts() == 3);
+
+    // The replay arrives after the decision and is kept for the referee.
+    std::vector<camera::FramePtr> clip;
+    for (int i = 0; i < 8; ++i)
+    {
+        auto f = std::make_shared<camera::Frame>();
+        f->width = 640;
+        f->height = 480;
+        f->jpeg = std::vector<uint8_t>{0xff, 0xd8, uint8_t(i), 0xff, 0xd9};
+        clip.push_back(f);
+    }
+    controller::cameraClip(id, clip, 10);
+    CHECK(sent.last("CAMERA") == "CAMERA " + id + " confident ready");
+    controller::tick(t + 5100);
+    CHECK(controller::state() == State::Monitoring);
+    checkLeds(0, 0, 0);
+
+    // The referee replays it from the dashboard, with the encoder too.
+    sent.clear();
+    controller::message("VIEW " + id, t + 6000);
+    controller::tick(t + 6010);
+    CHECK(sent.last("REPLAY") == "REPLAY " + id + " 0 8 0 1" && sent.frames.size() == 1);
+    controller::turn(1);
+    controller::tick(t + 6020);
+    CHECK(sent.last("REPLAY") == "REPLAY " + id + " 1 8 0 1");
+    controller::message("VIEW -", t + 6030);
+    controller::turn(1);
+    controller::tick(t + 6040);
+    CHECK(sent.last("REPLAY") == "REPLAY " + id + " 1 8 0 1");
+
+    // Until the server confirms it, a reconnect sends the automatic goal again.
+    sent.clear();
+    controller::resync();
+    CHECK(sent.count("AUTO " + id) == 1);
+    controller::message("DECISION " + id + " GOAL", t + 6100);
+    sent.clear();
+    controller::resync();
+    CHECK(sent.count("AUTO") == 0);
+    CHECK(blasts() == 3);
+
+    // Correction to No Goal: red for 3 s, no whistle, only once.
+    controller::message("DECISION " + id + " NO_GOAL", t + 7000);
+    checkLeds(0, 0, 1);
+    CHECK(controller::state() == State::NoGoal);
+    controller::tick(t + 10000);
+    checkLeds(0, 0, 0);
+    controller::message("DECISION " + id + " NO_GOAL", t + 11000);
+    checkLeds(0, 0, 0);
+    CHECK(controller::state() == State::Monitoring && blasts() == 3);
+
+    // Every uncertain answer waits for the referee, with the reason; no sound.
+    const char* uncertain[][2] = {
+        {"none", "no_ball"}, {"missed", "no_ball"}, {"low", "low_confidence"},
+        {"stationary", "ball_not_moving"},
+        {"insufficient", "insufficient"}, {"seen", "unverified"},
+        {"ignored", "camera_busy"}, {"unavailable", "camera_unavailable"},
+    };
+    for (auto& u : uncertain)
+    {
+        t += 20000;
+        controller::detected(controller::Source::Ir, t - 1000, t);
+        std::string e = controller::eventId();
+        checkLeds(0, 0, 0);
+        controller::cameraEvidence(e, evidenceOf(u[0]), "pending", t + 1500);
+        CHECK(controller::state() == State::Awaiting);
+        CHECK(sent.last("AWAITING") == "AWAITING " + e + " " + u[1]);
+        checkLeds(0, 1, 0);
+
+        // Late evidence cannot overturn it into an automatic goal.
+        controller::cameraEvidence(e, confident, "ready", t + 2000);
+        CHECK(controller::state() == State::Awaiting && sent.count("AUTO " + e) == 0);
+        controller::message("DECISION " + e + " NO_GOAL", t + 60000);
+        checkLeds(0, 0, 1);
+        controller::tick(t + 63000);
+    }
+    CHECK(blasts() == 3);
+
+    // No answer in time: Awaiting Decision.
+    t += 100000;
+    controller::detected(controller::Source::Ir, t - 1000, t);
+    std::string slow = controller::eventId();
+    controller::tick(t + 7990);
+    CHECK(controller::state() == State::Evaluating);
+    controller::tick(t + 8000);
+    CHECK(controller::state() == State::Awaiting);
+    CHECK(sent.last("AWAITING") == "AWAITING " + slow + " timeout");
+    checkLeds(0, 1, 0);
+    controller::message("DECISION " + slow + " GOAL", t + 9000);
+    CHECK(blasts() == 6);
+    controller::tick(t + 12000);
+
+    // Stale evidence from the previous event does not touch the new one.
+    t += 20000;
+    controller::detected(controller::Source::Ir, t - 1000, t);
+    controller::cameraEvidence(slow, confident, "ready", t + 100);
+    CHECK(controller::state() == State::Evaluating);
+    controller::message("DECISION " + controller::eventId() + " NO_GOAL", t + 200);
+    controller::tick(t + 3200);
+
+    // Camera offline, or the trigger cannot be sent: straight to the referee.
+    t += 20000;
+    controller::setCameraStatus("offline");
+    controller::detected(controller::Source::Ir, t - 1000, t);
+    CHECK(sent.last("AWAITING") == "AWAITING " + controller::eventId() + " camera_unavailable");
+    checkLeds(0, 1, 0);
+    controller::message("DECISION " + controller::eventId() + " NO_GOAL", t + 100);
+    controller::tick(t + 3100);
+    controller::setCameraStatus("yolo");
+    cameraAnswers = false;
+    t += 20000;
+    controller::detected(controller::Source::Ir, t - 1000, t);
+    CHECK(sent.last("CAMERA") == "CAMERA " + controller::eventId() + " unavailable unavailable");
+    CHECK(sent.last("AWAITING") == "AWAITING " + controller::eventId() + " camera_unavailable");
+    controller::message("DECISION " + controller::eventId() + " NO_GOAL", t + 100);
+    controller::tick(t + 3100);
+    cameraAnswers = true;
+
+    // Simulate Event never becomes automatic, even with confident evidence.
+    t += 20000;
+    controller::message("REVIEW", t);
+    std::string manual = controller::eventId();
+    controller::cameraEvidence(manual, confident, "pending", t + 1500);
+    CHECK(controller::state() == State::Awaiting && sent.count("AUTO " + manual) == 0);
+    checkLeds(0, 1, 0);
+    controller::message("DECISION " + manual + " GOAL", t + 5000);
+    checkLeds(1, 0, 0);
+    CHECK(blasts() == 9);
+
+    // A correction for an older automatic goal is ignored once a new one exists.
+    controller::tick(t + 8000);
+    t += 20000;
+    controller::detected(controller::Source::Ir, t - 1000, t);
+    std::string second = controller::eventId();
+    controller::cameraEvidence(second, confident, "pending", t + 1500);
+    CHECK(sent.last("AUTO") == "AUTO " + second + " ir" && blasts() == 12);
+    controller::tick(t + 5000);
+    controller::message("DECISION " + id + " NO_GOAL", t + 6000);
+    checkLeds(0, 0, 0);
+
+    controller::setCaptureHook(nullptr);
+    buzzer::cleanup();
+    leds::cleanup();
 }
 
-static void checkTone(const gpio_mock::Burst& b, int hz, int ms)
+static goalcam::Inference ball(int dtMs, double confidence, int x, int y)
 {
+    goalcam::Inference run{dtMs, confidence};
+    run.hasPosition = true;
+    run.x = x;
+    run.y = y;
+    return run;
+}
+
+static void testEvaluate()
+{
+    // Runs are listed relative to the trigger; the beam broke 1 s earlier.
+    auto judge = [](std::vector<goalcam::Inference> runs) { return goalcam::evaluate(runs, 1000); };
+
+    // A moving ball in two confident runs near the beam break.
+    goalcam::Evidence e = judge({{-2100, 0}, ball(-1800, 0.91, 200, 240), ball(-1500, 0.82, 290, 250),
+                                 {-1200, 0}, ball(-900, 0.4, 400, 260)});
+    CHECK(e.result == "confident" && e.measured);
+    CHECK(e.runs == 5 && e.ballRuns == 2 && std::abs(e.best - 0.91) < 1e-9);
+    CHECK(e.firstMs == -800 && e.lastMs == 100 && e.movePx == 90);
+
+    // The same ball standing still (e.g. a spare ball in view) is not a goal.
+    e = judge({ball(-1800, 0.95, 300, 240), ball(-1500, 0.95, 310, 245), ball(-1200, 0.95, 305, 240)});
+    CHECK(e.result == "stationary" && e.movePx < 40);
+    // Without positions the movement cannot be checked either.
+    CHECK(judge({{-1800, 0.95}, {-1500, 0.95}, {-1200, 0}}).result == "stationary");
+
+    // One confident run listed twice counts once.
+    CHECK(judge({ball(-1800, 0.91, 100, 100), ball(-1800, 0.91, 100, 100), ball(-1500, 0.3, 300, 100),
+                 {-1200, 0}}).result == "low");
+    // Just under the 75% threshold.
+    CHECK(judge({ball(-1800, 0.749, 100, 100), ball(-1500, 0.749, 200, 100), ball(-1200, 0.749, 300, 100)})
+              .result == "low");
+    CHECK(judge({{-1800, 0}, {-1500, 0}, {-1200, 0}, {-900, 0}}).result == "none");
+    // Too few runs to judge, even if both saw a moving ball.
+    CHECK(judge({ball(-1800, 0.95, 100, 100), ball(-1500, 0.95, 300, 100)}).result == "insufficient");
+    CHECK(judge({}).result == "insufficient");
+
+    // Window edges: 1.5 s before to 1 s after the beam break (here -2500 to 0 ms from the trigger).
+    e = judge({ball(-2501, 0.99, 100, 100), {-2500, 0}, {-1200, 0}, {0, 0}, ball(1, 0.99, 400, 100)});
+    CHECK(e.result == "none" && e.runs == 3);
+
+    // Detections long before or after the beam break do not count.
+    e = judge({ball(-4200, 0.99, 100, 100), ball(-3900, 0.99, 300, 100), {-1500, 0}, {-1200, 0},
+               {-900, 0}, ball(1500, 0.99, 500, 100)});
+    CHECK(e.result == "none" && e.runs == 3 && e.ballRuns == 0);
+
+    // A manual review has no beam break (offset 0): the window is around the trigger.
+    e = goalcam::evaluate({ball(-1400, 0.9, 100, 100), ball(-1000, 0.9, 200, 100), {-600, 0},
+                           ball(900, 0.9, 300, 100)}, 0);
+    CHECK(e.result == "confident" && e.runs == 4 && e.ballRuns == 3);
+
+    std::vector<goalcam::Inference> runs;
+    CHECK(goalcam::parseEvidence("EVIDENCE -1200:0.000 -900:0.880:320:241 0:1.000:5:6", runs));
+    CHECK(runs.size() == 3 && runs[1].dtMs == -900 && std::abs(runs[1].confidence - 0.88) < 1e-9);
+    CHECK(!runs[0].hasPosition && runs[1].hasPosition && runs[1].x == 320 && runs[1].y == 241);
+    CHECK(goalcam::parseEvidence("EVIDENCE", runs) && runs.empty());
+    CHECK(!goalcam::parseEvidence("EVIDENCE -10:0.5 x", runs));
+    CHECK(!goalcam::parseEvidence("EVIDENCE 5:1.5", runs));
+    CHECK(!goalcam::parseEvidence("EVIDENCE 5:0.5ms", runs));
+    CHECK(!goalcam::parseEvidence("EVIDENCE 5:0.5:3", runs));
+    CHECK(!goalcam::parseEvidence("EVIDENCE 5:0.5:3:4:5", runs));
+    CHECK(!goalcam::parseEvidence("EVIDENCE 5:0.5:", runs));
+    CHECK(!goalcam::parseEvidence("cam 15 fps", runs));
+}
+
+static void checkBlast(const gpio_mock::Burst& b, int ms)
+{
+    const int hz = 2000;
     double lengthMs = (b.endUs - b.startUs) / 1000.0;
     double duty = 100.0 * b.highUs / (b.cycles * 1e6 / hz);
-    std::cout << "Buzzer tone: " << b.cycles << " cycles in " << int(lengthMs) << " ms ("
+    std::cout << "Buzzer blast: " << b.cycles << " cycles in " << int(lengthMs) << " ms ("
               << int(b.cycles * 1000 / std::max(1.0, lengthMs)) << " Hz), duty " << int(duty + 0.5) << "%\n";
 
     CHECK(lengthMs >= ms - 10 && lengthMs <= ms + 2);
     CHECK(b.cycles >= hz * ms / 1000 * 95 / 100 && b.cycles <= hz * ms / 1000 + 1);
-    CHECK(duty >= 12 && duty <= 22);
+    CHECK(duty >= 20 && duty <= 32);
 }
 
-static void testBuzzerChime()
+static void testBuzzerWhistle()
 {
     using std::chrono::steady_clock;
     gpio_mock::reset();
@@ -717,69 +979,75 @@ static void testBuzzerChime()
     sleepMs(200);
     CHECK(gpio_mock::value("GPIO25") == 0 && gpio_mock::rises("GPIO25") == 0 && !buzzer::active());
 
-    // chime() returns at once: 1200 Hz for 150 ms, 80 ms silence, 1600 Hz for 200 ms.
+    // whistle() returns at once: 200 ms on, 150 off, 200 on, 150 off, 600 on, same pitch.
     auto start = steady_clock::now();
-    buzzer::chime();
+    buzzer::whistle();
     CHECK(steady_clock::now() - start < std::chrono::milliseconds(5));
     CHECK(buzzer::active());
-    waitForBuzzer();
-    CHECK(steady_clock::now() - start < std::chrono::milliseconds(600));
+    CHECK(blasts() == 3);
+    long long totalMs = std::chrono::duration_cast<std::chrono::milliseconds>(steady_clock::now() - start).count();
+    std::cout << "Whistle total: " << totalMs << " ms\n";
+    CHECK(totalMs >= 1290 && totalMs <= 1400);
 
     std::vector<gpio_mock::Burst> log = gpio_mock::burstLog("GPIO25");
-    CHECK(log.size() == 2);
-    if (log.size() == 2)
+    if (log.size() == 3)
     {
-        checkTone(log[0], 1200, 150);
-        checkTone(log[1], 1600, 200);
-        long long gapMs = (log[1].startUs - log[0].endUs) / 1000;
-        CHECK(gapMs >= 75 && gapMs <= 95);
+        checkBlast(log[0], 200);
+        checkBlast(log[1], 200);
+        checkBlast(log[2], 600);
+        // Silent between the blasts.
+        for (int i = 1; i < 3; ++i)
+        {
+            long long gapMs = (log[i].startUs - log[i - 1].endUs) / 1000;
+            CHECK(gapMs >= 145 && gapMs <= 170);
+        }
     }
     CHECK(gpio_mock::value("GPIO25") == 0 && !buzzer::active());
 
     // Repeated requests while it plays neither overlap nor restart it.
-    buzzer::chime();
-    sleepMs(100);
-    buzzer::chime();
-    sleepMs(200);
-    buzzer::chime();
-    waitForBuzzer();
+    sleepMs(50);
+    buzzer::whistle();
+    sleepMs(300);
+    buzzer::whistle();
+    sleepMs(500);
+    buzzer::whistle();
+    CHECK(blasts() == 6);
     log = gpio_mock::burstLog("GPIO25");
-    CHECK(log.size() == 4);
-    if (log.size() == 4)
-        CHECK(log[3].endUs - log[2].startUs < 450000);
+    CHECK(log[5].endUs - log[3].startUs < 1400000);
 
     // A later, separate goal sounds again.
-    buzzer::chime();
-    waitForBuzzer();
-    CHECK(gpio_mock::burstLog("GPIO25").size() == 6);
-
-    // Shutdown during a tone, or during the silence, stops at once with the pin low.
-    buzzer::chime();
     sleepMs(50);
+    buzzer::whistle();
+    CHECK(blasts() == 9);
+
+    // Shutdown during a blast, or during a pause, stops at once with the pin low.
+    sleepMs(50);
+    buzzer::whistle();
+    sleepMs(100);
     start = steady_clock::now();
     buzzer::cleanup();
     CHECK(steady_clock::now() - start < std::chrono::milliseconds(20));
     CHECK(gpio_mock::value("GPIO25") == 0 && !gpio_mock::isOpen("GPIO25"));
-    CHECK(gpio_mock::burstLog("GPIO25").size() == 7);
+    CHECK(gpio_mock::burstLog("GPIO25").size() == 10);
 
     gpio_mock::reset();
     CHECK(buzzer::init());
-    buzzer::chime();
-    sleepMs(185);
+    buzzer::whistle();
+    sleepMs(270);
     start = steady_clock::now();
     buzzer::cleanup();
     CHECK(steady_clock::now() - start < std::chrono::milliseconds(20));
     CHECK(gpio_mock::burstLog("GPIO25").size() == 1 && gpio_mock::value("GPIO25") == 0);
 
     // No sound after shutdown or before init.
-    buzzer::chime();
+    buzzer::whistle();
     CHECK(!buzzer::active());
     buzzer::cleanup();
 
     // An unavailable buzzer line is reported, not hidden.
     gpio_mock::setBroken("GPIO25", true);
     CHECK(!buzzer::init());
-    buzzer::chime();
+    buzzer::whistle();
     CHECK(!buzzer::active());
     gpio_mock::reset();
 }
@@ -788,29 +1056,32 @@ static void testLeds()
 {
     gpio_mock::reset();
     CHECK(leds::init());
-    checkLeds(0, 0);
+    checkLeds(0, 0, 0);
 
+    // Only one LED at a time.
     CHECK(leds::show(leds::Color::Green));
-    checkLeds(1, 0);
+    checkLeds(1, 0, 0);
+    CHECK(leds::show(leds::Color::Yellow));
+    checkLeds(0, 1, 0);
     CHECK(leds::show(leds::Color::Red));
-    checkLeds(0, 1);
+    checkLeds(0, 0, 1);
     CHECK(leds::show(leds::Color::Off));
-    checkLeds(0, 0);
+    checkLeds(0, 0, 0);
 
     // A write failure is reported.
-    gpio_mock::setBroken("GPIO5", true);
-    CHECK(!leds::show(leds::Color::Green));
-    gpio_mock::setBroken("GPIO5", false);
+    gpio_mock::setBroken("GPIO6", true);
+    CHECK(!leds::show(leds::Color::Yellow));
+    gpio_mock::setBroken("GPIO6", false);
     leds::cleanup();
-    checkLeds(0, 0);
-    CHECK(!gpio_mock::isOpen("GPIO5") && !gpio_mock::isOpen("GPIO26"));
+    checkLeds(0, 0, 0);
+    CHECK(!gpio_mock::isOpen("GPIO5") && !gpio_mock::isOpen("GPIO6") && !gpio_mock::isOpen("GPIO26"));
 
-    // One missing LED does not disable the other.
+    // One missing LED does not disable the others.
     gpio_mock::reset();
     gpio_mock::setBroken("GPIO26", true);
     CHECK(!leds::init());
-    CHECK(leds::show(leds::Color::Green));
-    CHECK(gpio_mock::value("GPIO5") == 1);
+    CHECK(leds::show(leds::Color::Yellow));
+    CHECK(gpio_mock::value("GPIO6") == 1 && gpio_mock::value("GPIO5") == 0);
     leds::cleanup();
     gpio_mock::reset();
 }
@@ -917,8 +1188,9 @@ static void testIrThread()
 static void testPinsDistinct()
 {
     std::vector<std::string> all = {pins::kEncoderA, pins::kEncoderB, pins::kEncoderButton,
-                                    pins::kLedGreen, pins::kLedRed, pins::kBuzzer};
+                                    pins::kLedGreen, pins::kLedYellow, pins::kLedRed, pins::kBuzzer};
     all.insert(all.end(), std::begin(pins::kIrBeams), std::end(pins::kIrBeams));
+    CHECK(all.size() == 10 && std::string(pins::kLedYellow) == "GPIO6");
     std::sort(all.begin(), all.end());
     CHECK(std::adjacent_find(all.begin(), all.end()) == all.end());
 }
@@ -1280,9 +1552,10 @@ static int startStandIn(const std::string& dir, CamEvents& ev, int timeoutMs)
 
     goalcam::Callbacks cb;
     cb.status = [&](const std::string& s) { std::lock_guard<std::mutex> l(ev.m); ev.status.push_back(s); };
-    cb.evidence = [&](const std::string& id, const std::string& e, const std::string& r) {
+    cb.evidence = [&](const std::string& id, const goalcam::Evidence& e, const std::string& r) {
         std::lock_guard<std::mutex> l(ev.m);
-        ev.evidence.push_back(id + " " + e + " " + r);
+        std::string counts = e.measured ? "(" + std::to_string(e.runs) + "/" + std::to_string(e.ballRuns) + ")" : "";
+        ev.evidence.push_back(id + " " + e.result + counts + " " + r);
     };
     cb.clip = [&](const std::string& id, std::vector<camera::FramePtr> frames, int fps) {
         std::lock_guard<std::mutex> l(ev.m);
@@ -1325,7 +1598,7 @@ static void testGoalCamAdapter()
     }
 
     // The trigger reaches goal_cam.py's UDP port as "goal".
-    CHECK(goalcam::capture("E1"));
+    CHECK(goalcam::capture("E1", 0));
     char buf[16] = {};
     pollfd p = {udp, POLLIN, 0};
     CHECK(poll(&p, 1, 1000) == 1 && recv(udp, buf, sizeof(buf), 0) == 4 && std::string(buf) == "goal");
@@ -1350,7 +1623,7 @@ static void testGoalCamAdapter()
     }
 
     // Ignored by goal_cam.py's cooldown: evidence and replay both unavailable.
-    goalcam::capture("E2");
+    goalcam::capture("E2", 0);
     appendLine(log, "goal trigger from udp message ignored (too soon after the last one)");
     sleepMs(2200);
     {
@@ -1360,7 +1633,7 @@ static void testGoalCamAdapter()
     }
 
     // No ball, but the clip never arrives: replay unavailable, evidence kept.
-    goalcam::capture("E3");
+    goalcam::capture("E3", 0);
     appendLine(log, "GOAL trigger from udp message, recording 1.5 more seconds");
     appendLine(log, "GOAL - camera saw the ball: NO (40 frames, 0 ball detections)");
     sleepMs(2200);
@@ -1371,7 +1644,7 @@ static void testGoalCamAdapter()
     }
 
     // A YES/NO before goal_cam.py acknowledged this trigger is not this event's.
-    goalcam::capture("E4");
+    goalcam::capture("E4", 0);
     appendLine(log, "GOAL - camera saw the ball: YES (82 frames, 9 ball detections)");
     sleepMs(2200);
     {
@@ -1379,14 +1652,48 @@ static void testGoalCamAdapter()
         CHECK(ev.evidence.size() == 5 && ev.evidence[4] == "E4 unavailable unavailable");
     }
 
-    // Too little video buffered: both unavailable straight away.
-    goalcam::capture("E5");
+    // Too little video buffered: insufficient, replay unavailable, straight away.
+    goalcam::capture("E5", 0);
     appendLine(log, "GOAL trigger from udp message, recording 1.5 more seconds");
     appendLine(log, "not enough video in the buffer for a replay");
     sleepMs(500);
     {
         std::lock_guard<std::mutex> l(ev.m);
-        CHECK(ev.evidence.size() == 6 && ev.evidence[5] == "E5 unavailable unavailable");
+        CHECK(ev.evidence.size() == 6 && ev.evidence[5] == "E5 insufficient unavailable");
+    }
+
+    // EVIDENCE lists the inference runs; it is judged around the beam break
+    // (1 s before the trigger here), and the YES that follows does not change it.
+    goalcam::capture("E6", 1000);
+    appendLine(log, "GOAL trigger from udp message, recording 1.5 more seconds");
+    appendLine(log, "EVIDENCE -900:0.910:200:240 -600:0.880:330:250 -300:0.000 0:0.000");
+    appendLine(log, "GOAL - camera saw the ball: YES (82 frames, 17 ball detections)");
+    sleepMs(500);
+    {
+        std::lock_guard<std::mutex> l(ev.m);
+        CHECK(ev.evidence.size() == 7 && ev.evidence[6] == "E6 confident(4/2) pending");
+    }
+
+    // A malformed EVIDENCE line falls back to the unverified YES.
+    goalcam::capture("E7", 1000);
+    appendLine(log, "GOAL trigger from udp message, recording 1.5 more seconds");
+    appendLine(log, "EVIDENCE nonsense");
+    appendLine(log, "GOAL - camera saw the ball: YES (82 frames, 17 ball detections)");
+    sleepMs(500);
+    {
+        std::lock_guard<std::mutex> l(ev.m);
+        CHECK(ev.evidence.size() == 8 && ev.evidence[7] == "E7 seen pending");
+    }
+
+    // EVIDENCE before goal_cam.py accepted this trigger belongs to an older event.
+    goalcam::capture("E8", 0);
+    appendLine(log, "EVIDENCE 0:0.95 100:0.95 200:0.95");
+    appendLine(log, "GOAL trigger from udp message, recording 1.5 more seconds");
+    appendLine(log, "GOAL - camera saw the ball: NO (40 frames, 0 ball detections)");
+    sleepMs(500);
+    {
+        std::lock_guard<std::mutex> l(ev.m);
+        CHECK(ev.evidence.size() == 9 && ev.evidence[8] == "E8 missed pending");
     }
 
     appendLine(log, "camera stopped giving frames");
@@ -1412,7 +1719,7 @@ static void testCloseEvents()
     CHECK(udp >= 0);
 
     // Event A's clip is still being saved when event B is triggered 3 s later.
-    goalcam::capture("B");
+    goalcam::capture("B", 0);
     writeFile(replays + "/" + clipName(-3), makeAvi(4, 15, true));
     sleepMs(600);
     {
@@ -1484,22 +1791,25 @@ static void testControllerWithGoalCam()
             sent.frames.push_back({slot, header});
         },
         8);
-    controller::setCaptureHook([&](const std::string& id) { captures.push_back(id); });
+    controller::setCaptureHook([&](const std::string& id, int) { captures.push_back(id); return true; });
     controller::setCameraStatus("yolo");
 
     controller::detected(controller::Source::Ir, 9000, 10000);
     std::string id = controller::eventId();
     CHECK(captures.size() == 1 && captures[0] == id);
     CHECK(sent.count("EVENT " + id + " ir") == 1 && sent.last("CAMERA") == "CAMERA " + id + " pending pending");
-    checkLeds(0, 0);
+    checkLeds(0, 0, 0);
 
     controller::tick(10000);
     CHECK(sent.last("REPLAY") == "REPLAY " + id + " 0 0 0 0");
     CHECK(sent.frames.empty());
 
-    controller::cameraEvidence("other", "seen", "pending");
-    controller::cameraEvidence(id, "seen", "pending");
+    // An old goal_cam.py's plain YES is unverified: the referee decides.
+    controller::cameraEvidence("other", evidenceOf("seen"), "pending", 10000);
+    controller::cameraEvidence(id, evidenceOf("seen"), "pending", 10000);
     CHECK(sent.last("CAMERA") == "CAMERA " + id + " seen pending" && sent.count("CAMERA") == 2);
+    CHECK(sent.last("AWAITING") == "AWAITING " + id + " unverified");
+    checkLeds(0, 1, 0);
 
     std::vector<camera::FramePtr> clip;
     for (int i = 0; i < 8; ++i)
@@ -1523,7 +1833,7 @@ static void testControllerWithGoalCam()
     CHECK(sent.frames[0].second == "FRAME REPLAY " + id + " 0 640 480 -1 -1 0 0 5 jpeg");
 
     // A later report cannot take back a replay that already arrived.
-    controller::cameraEvidence(id, "seen", "unavailable");
+    controller::cameraEvidence(id, evidenceOf("seen"), "unavailable", 10025);
     CHECK(sent.last("CAMERA") == "CAMERA " + id + " seen ready");
 
     controller::turn(1);
@@ -1544,9 +1854,9 @@ static void testControllerWithGoalCam()
     CHECK(sent.count("EVENT " + id) == 1 && sent.last("CAMERA") == "CAMERA " + id + " seen ready");
 
     controller::message("DECISION " + id + " GOAL", 21000);
-    checkLeds(1, 0);
+    checkLeds(1, 0, 0);
     sent.clear();
-    controller::cameraEvidence(id, "missed", "pending");
+    controller::cameraEvidence(id, evidenceOf("missed"), "pending", 21005);
     controller::cameraClip(id, clip, 10);
     controller::tick(21010);
     CHECK(sent.count("CAMERA") == 0 && sent.count("REPLAY") == 0 && sent.frames.empty());
@@ -1568,7 +1878,9 @@ int main()
     testPinsDistinct();
     testLeds();
     testController();
-    testBuzzerChime();
+    testHybrid();
+    testEvaluate();
+    testBuzzerWhistle();
     testBeamCheck();
     testIrThread();
     testCamera();

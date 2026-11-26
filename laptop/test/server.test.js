@@ -143,13 +143,15 @@ test("board events, replay and decisions", async () => {
         assert.deepStrictEqual(Buffer.from(dashboard.latest.live.data, "base64"), live);
         assert.deepStrictEqual(dashboard.latest.live.ball, { x: 5, y: 6, r: 4, zone: 3 });
 
-        board.send("EVENT 1700-1 camera");
+        board.send("EVENT 1700-1 ir");
         let state = await dashboard.state((s) => s.pending, "camera event");
         assert.strictEqual(state.pending.id, "1700-1");
 
-        board.send("EVENT 1700-1 camera,ir");
-        state = await dashboard.state((s) => s.pending.sources.length === 2, "IR evidence");
-        assert.deepStrictEqual(state.pending.sources, ["camera", "ir"]);
+        board.send("EVENT 1700-1 ir,camera");
+        state = await dashboard.state((s) => s.pending.sources.length === 2, "camera evidence");
+        assert.deepStrictEqual(state.pending.sources, ["ir", "camera"]);
+        assert.strictEqual(state.pending.manual, false);
+        assert.strictEqual(state.pending.phase, "evaluating");
 
         // Replay updates for another event or out of range are ignored.
         board.send("REPLAY other 1 10 0 0");
@@ -185,6 +187,17 @@ test("board events, replay and decisions", async () => {
         assert.strictEqual(second.latest.update.pending.id, "1700-1");
         second.close();
 
+        // No decision while the board is still evaluating the evidence.
+        dashboard.emit("decision", { id: "1700-1", result: "GOAL" });
+        await sleep(100);
+        assert.ok(dashboard.latest.update.pending);
+        assert.ok(!board.lines.some((l) => l.startsWith("DECISION")));
+
+        board.send("AWAITING 1700-1 bogus");
+        board.send("AWAITING 1700-1 low_confidence");
+        state = await dashboard.state((s) => s.pending.phase === "awaiting", "awaiting");
+        assert.strictEqual(state.pending.reason, "low_confidence");
+
         // A double click sends the decision twice: it is counted once.
         dashboard.emit("decision", { id: "1700-1", result: "MAYBE" });
         dashboard.emit("decision", { id: "1700-1", result: "GOAL" });
@@ -193,7 +206,9 @@ test("board events, replay and decisions", async () => {
         state = await dashboard.state((s) => !s.pending, "decision recorded");
         assert.strictEqual(state.goals, 1);
         assert.strictEqual(state.history.length, 1);
-        assert.deepStrictEqual(state.history[0].sources, ["camera", "ir"]);
+        assert.deepStrictEqual(state.history[0].sources, ["ir", "camera"]);
+        assert.strictEqual(state.history[0].auto, false);
+        assert.strictEqual(state.history[0].reason, "low_confidence");
         assert.strictEqual(state.replay, null);
         await sleep(50);
         assert.ok(!board.lines.some((l) => l.startsWith("DECISION")));
@@ -203,7 +218,7 @@ test("board events, replay and decisions", async () => {
         assert.ok(!board.lines.some((l) => l.startsWith("DECISION")));
 
         // A late EVENT for the decided id gets the decision again, not a new review.
-        board.send("EVENT 1700-1 camera,ir");
+        board.send("EVENT 1700-1 ir,camera");
         await board.take("DECISION 1700-1 GOAL");
         assert.strictEqual(dashboard.latest.update.pending, null);
 
@@ -211,7 +226,9 @@ test("board events, replay and decisions", async () => {
         dashboard.emit("simulateGoal");
         await board.take("REVIEW");
         board.send("EVENT 1700-2 manual");
-        state = await dashboard.state((s) => s.pending, "manual event");
+        board.send("AWAITING 1700-2 manual");
+        state = await dashboard.state((s) => s.pending && s.pending.phase === "awaiting", "manual event");
+        assert.strictEqual(state.pending.manual, true);
         assert.strictEqual(state.pending.number, 2);
 
         dashboard.emit("decision", { id: "1700-2", result: "NO GOAL" });
@@ -223,7 +240,8 @@ test("board events, replay and decisions", async () => {
 
         // Simulate Event while a review is pending does nothing.
         board.send("EVENT 1700-3 ir");
-        await dashboard.state((s) => s.pending && s.pending.id === "1700-3", "third event");
+        board.send("AWAITING 1700-3 no_ball");
+        await dashboard.state((s) => s.pending && s.pending.phase === "awaiting", "third event");
         dashboard.emit("simulateGoal");
         await sleep(100);
         assert.ok(!board.lines.includes("REVIEW"));
@@ -264,6 +282,7 @@ test("YOLO camera evidence, stream and JPEG replay frames", async () => {
         assert.strictEqual(dashboard.latest.update.board.stream, "http://127.0.0.1:8080/stream");
 
         board.send("EVENT 2000-1 ir");
+        board.send("AWAITING 2000-1 unverified");
         board.send("CAMERA 2000-1 pending pending");
         state = await dashboard.state((s) => s.pending && s.pending.camera === "pending", "camera pending");
         assert.strictEqual(state.pending.cameraReplay, "pending");
@@ -313,7 +332,8 @@ test("board reconnect during a review", async () => {
     try {
         await board.ready;
         board.send("EVENT 1800-5 ir");
-        await dashboard.state((s) => s.pending, "IR event");
+        board.send("AWAITING 1800-5 timeout");
+        await dashboard.state((s) => s.pending && s.pending.phase === "awaiting", "IR event");
 
         board.close();
         let state = await dashboard.state((s) => !s.board.connected, "board disconnected");
@@ -333,10 +353,13 @@ test("board reconnect during a review", async () => {
         assert.strictEqual(dashboard.latest.update.goals, 1);
 
         // A board restarted mid-review reports a new event: the stale one is replaced.
-        board.send("EVENT 1800-6 camera");
+        board.send("EVENT 1800-6 ir");
+        board.send("AWAITING 1800-6 no_ball");
         await dashboard.state((s) => s.pending && s.pending.id === "1800-6", "event 6");
         board.send("EVENT 1900-1 ir");
-        state = await dashboard.state((s) => s.pending && s.pending.id === "1900-1", "stale event replaced");
+        board.send("AWAITING 1900-1 no_ball");
+        state = await dashboard.state((s) => s.pending && s.pending.id === "1900-1" &&
+            s.pending.phase === "awaiting", "stale event replaced");
         assert.deepStrictEqual(state.pending.sources, ["ir"]);
         dashboard.emit("decision", { id: "1800-6", result: "GOAL" });
         dashboard.emit("decision", { id: "1900-1", result: "NO GOAL" });
@@ -525,6 +548,148 @@ test("IR degraded status is shown", async () => {
         board.send("STATUS monitoring yolo degraded -");
         const state = await dashboard.state((s) => s.board.ir === "degraded", "degraded IR");
         assert.strictEqual(state.board.camera, "yolo");
+    } finally {
+        board.close();
+        dashboard.close();
+        server.close();
+    }
+});
+
+test("automatic goals: recorded once, replayable and correctable once", async () => {
+    const { server, dashboard } = await setup();
+    let board = new Board(server.boardPort);
+
+    try {
+        await board.ready;
+        board.send("STATUS evaluating yolo degraded 3000-1");
+        board.send("EVENT 3000-1 ir");
+        board.send("CAMERA 3000-1 pending pending");
+        let state = await dashboard.state((s) => s.pending && s.pending.phase === "evaluating", "evaluating");
+        assert.strictEqual(state.board.state, "evaluating");
+
+        // AUTO is only accepted for IR events.
+        board.send("AUTO 3000-1 manual");
+        board.send("AUTO 3000-1 camera");
+        await sleep(100);
+        assert.strictEqual(dashboard.latest.update.goals, 0);
+
+        board.send("CAMERA 3000-1 confident pending");
+        board.send("CONFIDENCE 3000-1 6 3 91 -900 100");
+        board.send("CONFIDENCE 3000-1 6 3 91 -900 100 120");
+        board.send("AUTO 3000-1 ir");
+        await board.take("DECISION 3000-1 GOAL");
+        state = await dashboard.state((s) => !s.pending && s.goals === 1, "automatic goal");
+        const entry = state.history[0];
+        assert.strictEqual(entry.auto, true);
+        assert.strictEqual(entry.decision, "GOAL");
+        assert.strictEqual(entry.camera, "confident");
+        assert.deepStrictEqual(entry.confidence, { runs: 6, ballRuns: 3, best: 91, firstMs: -900, lastMs: 100, movePx: 120 });
+
+        // A repeated AUTO (e.g. after a reconnect) is acknowledged, not counted again.
+        board.send("AUTO 3000-1 ir");
+        await board.take("DECISION 3000-1 GOAL");
+        await sleep(50);
+        assert.strictEqual(dashboard.latest.update.goals, 1);
+        assert.strictEqual(dashboard.latest.update.history.length, 1);
+
+        // Its replay arrives after the decision.
+        board.send("CAMERA 3000-1 confident ready");
+        state = await dashboard.state((s) => s.history[0].cameraReplay === "ready", "late replay");
+
+        // The referee watches it with the replay controls.
+        dashboard.emit("view", { id: "nope" });
+        dashboard.emit("view", { id: "3000-1" });
+        await board.take("VIEW 3000-1");
+        board.send("REPLAY 3000-1 0 8 0 1");
+        board.frame("REPLAY", "3000-1", 0, 640, 480, Buffer.from([0xff, 0xd8, 1, 0xff, 0xd9]), "jpeg");
+        state = await dashboard.state((s) => s.viewing === "3000-1" && s.replay, "viewing");
+        await waitUntil(() => dashboard.latest.replayFrame && dashboard.latest.replayFrame.id === "3000-1", "frame");
+        dashboard.emit("replay", { action: "next" });
+        await board.take("REPLAY NEXT");
+        dashboard.emit("view", null);
+        await board.take("VIEW -");
+        state = await dashboard.state((s) => s.viewing === null, "back to live");
+
+        // Correct it to No Goal: the same entry changes, one goal less, once.
+        dashboard.emit("correct", { id: "3000-1" });
+        dashboard.emit("correct", { id: "3000-1" });
+        await board.take("DECISION 3000-1 NO_GOAL");
+        state = await dashboard.state((s) => s.goals === 0, "corrected");
+        assert.strictEqual(state.history.length, 1);
+        assert.strictEqual(state.history[0].decision, "NO GOAL");
+        assert.strictEqual(state.history[0].corrected, true);
+        await sleep(100);
+        assert.ok(!board.lines.some((l) => l.startsWith("DECISION")));
+        assert.strictEqual(dashboard.latest.update.goals, 0);
+
+        // A late AUTO after the correction gets the corrected decision back.
+        board.send("AUTO 3000-1 ir");
+        await board.take("DECISION 3000-1 NO_GOAL");
+        assert.strictEqual(dashboard.latest.update.goals, 0);
+
+        // Manual events cannot be corrected or viewed this way.
+        board.send("EVENT 3000-2 manual");
+        board.send("AWAITING 3000-2 manual");
+        await dashboard.state((s) => s.pending && s.pending.phase === "awaiting", "manual awaiting");
+        dashboard.emit("decision", { id: "3000-2", result: "GOAL" });
+        await board.take("DECISION 3000-2 GOAL");
+        dashboard.emit("correct", { id: "3000-2" });
+        dashboard.emit("view", { id: "3000-2" });
+        await sleep(100);
+        assert.strictEqual(dashboard.latest.update.goals, 1);
+        assert.strictEqual(dashboard.latest.update.history[0].manual, true);
+        assert.ok(!board.lines.some((l) => l.startsWith("VIEW")));
+
+        // An automatic goal sent while the server was restarting is still recorded.
+        board.close();
+        await dashboard.state((s) => !s.board.connected, "disconnected");
+        board = new Board(server.boardPort);
+        await board.ready;
+        board.send("AUTO 3000-3 ir,camera");
+        await board.take("DECISION 3000-3 GOAL");
+        state = await dashboard.state((s) => s.goals === 2, "auto after reconnect");
+        assert.strictEqual(state.history[0].id, "3000-3");
+        assert.strictEqual(state.history[0].number, 3);
+
+        // No correction while another event is pending.
+        board.send("EVENT 3000-4 ir");
+        await dashboard.state((s) => s.pending && s.pending.id === "3000-4", "pending");
+        dashboard.emit("correct", { id: "3000-3" });
+        await sleep(100);
+        assert.strictEqual(dashboard.latest.update.goals, 2);
+    } finally {
+        board.close();
+        dashboard.close();
+        server.close();
+    }
+});
+
+test("a pending manual decision survives a board reconnect", async () => {
+    const { server, dashboard } = await setup();
+    let board = new Board(server.boardPort);
+
+    try {
+        await board.ready;
+        board.send("EVENT 4000-1 manual");
+        board.send("AWAITING 4000-1 manual");
+        await dashboard.state((s) => s.pending && s.pending.phase === "awaiting", "awaiting");
+
+        board.close();
+        await dashboard.state((s) => !s.board.connected, "disconnected");
+        board = new Board(server.boardPort);
+        await board.ready;
+        board.send("EVENT 4000-1 manual");
+        board.send("AWAITING 4000-1 manual");
+        await dashboard.state((s) => s.board.connected, "reconnected");
+        await sleep(50);
+        const state = dashboard.latest.update;
+        assert.strictEqual(state.pending.id, "4000-1");
+        assert.strictEqual(state.pending.number, 1);
+        assert.strictEqual(state.pending.phase, "awaiting");
+
+        dashboard.emit("decision", { id: "4000-1", result: "NO GOAL" });
+        await board.take("DECISION 4000-1 NO_GOAL");
+        await dashboard.state((s) => !s.pending && s.goals === 0 && s.history.length === 1, "decided");
     } finally {
         board.close();
         dashboard.close();

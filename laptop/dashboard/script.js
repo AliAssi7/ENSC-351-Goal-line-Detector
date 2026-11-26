@@ -3,6 +3,9 @@ const socket = io();
 const simulateBtn = document.getElementById("simulateBtn");
 const confirmBtn = document.getElementById("confirmBtn");
 const rejectBtn = document.getElementById("rejectBtn");
+const autoActions = document.getElementById("autoActions");
+const viewBtn = document.getElementById("viewBtn");
+const correctBtn = document.getElementById("correctBtn");
 
 const reviewStatus = document.getElementById("reviewStatus");
 const decisionTitle = document.getElementById("decisionTitle");
@@ -32,30 +35,51 @@ const replayLabel = document.getElementById("replayLabel");
 
 const context = cameraCanvas.getContext("2d");
 
-const SOURCE_LABELS = {
-    camera: "Camera: ball wholly over the line",
-    ir: "IR: beam broken",
-    manual: "Manual review"
-};
-
 const CAMERA_LABELS = {
     yolo: "YOLO Online", starting: "Starting", live: "Live", sim: "Simulated", file: "Video File", offline: "Offline"
 };
 
-// The YOLO camera only supports the review; it cannot show the whole ball crossed.
+// [label, colour class] for each board state.
+const STATE_LABELS = {
+    monitoring: ["MONITORING", null],
+    evaluating: ["EVALUATING EVIDENCE", null],
+    awaiting: ["AWAITING DECISION", "wait"],
+    goal: ["GOAL", "ok"],
+    nogoal: ["NO GOAL", "bad"]
+};
+
+const AWAIT_REASONS = {
+    manual: "Review initiated by the referee using Simulate Event.",
+    no_ball: "IR interruption detected, but the camera did not detect a soccer ball.",
+    low_confidence: "IR interruption detected, but the camera could not confidently verify a soccer ball.",
+    ball_not_moving: "IR interruption detected, but the ball the camera saw was not moving, so it may not be the one at the goal.",
+    insufficient: "IR interruption detected, but there was not enough camera footage to verify it.",
+    unverified: "IR interruption detected. The camera reported a ball without a confidence score.",
+    camera_busy: "IR interruption detected, but the camera was still saving the previous replay.",
+    camera_unavailable: "IR interruption detected, but the camera is unavailable.",
+    timeout: "IR interruption detected, but the camera did not answer in time."
+};
+
+// The camera supports the decision; it cannot show the whole ball crossed.
 const CAMERA_EVIDENCE = {
-    pending: "Camera (YOLO): checking for the ball",
-    seen: "Camera (YOLO): ball detected around the trigger",
-    missed: "Camera (YOLO): no ball detected around the trigger",
-    ignored: "Camera (YOLO): trigger ignored during the camera's 3 s cooldown",
-    unavailable: "Camera (YOLO): detection result unavailable"
+    pending: ["checking the footage", null],
+    confident: ["soccer ball confidently detected", "ok"],
+    stationary: ["ball detected but not moving", "bad"],
+    low: ["ball detected at low confidence", "bad"],
+    none: ["no soccer ball detected", "bad"],
+    insufficient: ["not enough footage", "bad"],
+    seen: ["ball reported, no confidence score", null],
+    missed: ["no ball reported", "bad"],
+    ignored: ["trigger ignored (camera busy)", "bad"],
+    unavailable: ["no result", "bad"]
 };
 const IR_LABELS = { ok: "Online", degraded: "Degraded", error: "Error", disabled: "Disabled", offline: "Offline" };
 const OK_CAMERA = ["yolo", "live", "sim", "file"];
-const CAMERA_EVIDENCE_STATUS = { seen: "ok", missed: "bad", ignored: "bad", unavailable: "bad" };
 
 let state = null;
 let pending = null;
+let viewing = null;     // the automatic goal whose replay is shown
+let replayEvent = null; // pending or viewing: the event in the replay panel
 let liveFrame = null;
 let replayFrame = null;
 let calibration = null;
@@ -83,8 +107,10 @@ socket.on("disconnect", () => {
 socket.on("update", (update) => {
     state = update;
     pending = state.pending;
+    viewing = state.viewing ? state.history.find((e) => e.id === state.viewing) || null : null;
+    replayEvent = pending || viewing;
 
-    if (!pending || (replayFrame && replayFrame.id !== pending.id)) {
+    if (!replayEvent || (replayFrame && replayFrame.id !== replayEvent.id)) {
         replayFrame = null;
     }
 
@@ -97,7 +123,7 @@ socket.on("live", (frame) => {
 });
 
 socket.on("replayFrame", (frame) => {
-    if (pending && frame.id === pending.id) {
+    if (replayEvent && frame.id === replayEvent.id) {
         replayFrame = frame;
         drawCamera();
     }
@@ -116,8 +142,8 @@ function render() {
     } else if (!board.connected) {
         setStatus(systemStatus, "BeagleY-AI Disconnected", "bad");
     } else {
-        const modes = { monitoring: "Monitoring", review: "Reviewing", goal: "Goal Confirmed" };
-        setStatus(systemStatus, `BeagleY-AI Connected - ${modes[board.state] || "Starting"}`, "ok");
+        const mode = STATE_LABELS[board.state] ? STATE_LABELS[board.state][0].toLowerCase() : "starting";
+        setStatus(systemStatus, `BeagleY-AI Connected - ${mode}`, "ok");
     }
 
     if (!board.connected) {
@@ -130,14 +156,25 @@ function render() {
             OK_CAMERA.includes(board.camera) ? "ok" : board.camera === "offline" ? "bad" : null);
     }
 
-    const deciding = pending !== null && pending.id === decidedId;
+    // Decisions only once the event is waiting for the referee.
+    const awaiting = pending !== null && pending.phase === "awaiting" && pending.id !== decidedId;
 
     simulateBtn.disabled = !connected || !board.connected || pending !== null;
-    confirmBtn.disabled = !connected || pending === null || deciding;
-    rejectBtn.disabled = !connected || pending === null || deciding;
+    confirmBtn.disabled = !connected || !awaiting;
+    rejectBtn.disabled = !connected || !awaiting;
+
+    // The latest automatic goal can be replayed and corrected.
+    const auto = connected ? latestAutoGoal() : null;
+    autoActions.hidden = !auto || pending !== null;
+    viewBtn.textContent = viewing ? "Back to Live" : "Review Replay";
+    viewBtn.disabled = !board.connected || !auto || (!viewing && state.history[0] !== auto);
+    correctBtn.disabled = !board.connected || !auto;
 
     if (connected) {
         goalCount.textContent = state.goals;
+        const phase = board.connected ? board.state : pending && pending.phase;
+        const [label, colour] = STATE_LABELS[phase] || ["MONITORING", null];
+        setStatus(reviewStatus, label, colour);
         renderReview();
         showHistory(state.history);
     }
@@ -146,11 +183,37 @@ function render() {
     drawCamera();
 }
 
-// status: "ok" (green), "bad" (red) or null (neutral).
+function latestAutoGoal() {
+    const entry = state.history.find((e) => e.auto);
+    return entry && entry.decision === "GOAL" && !entry.corrected ? entry : null;
+}
+
+// status: "ok" (green), "wait" (yellow), "bad" (red) or null (neutral).
 function setStatus(element, text, status) {
     element.textContent = text;
     element.classList.toggle("ok", status === "ok");
+    element.classList.toggle("wait", status === "wait");
     element.classList.toggle("bad", status === "bad");
+}
+
+function confidenceText(c) {
+    if (!c) {
+        return "";
+    }
+    let text = `best ${c.best}%, ball in ${c.ballRuns} of ${c.runs} model runs`;
+    if (c.best > 0) {
+        text += `, ${c.firstMs} to ${c.lastMs} ms from the beam break`;
+    }
+    return text;
+}
+
+function cameraParts(event) {
+    if (!event.camera) {
+        return [];
+    }
+    const [text, colour] = CAMERA_EVIDENCE[event.camera];
+    const details = confidenceText(event.confidence);
+    return [[`Camera (YOLO): ${text}${details ? ` (${details})` : ""}.`, colour]];
 }
 
 function setDescription(parts) {
@@ -167,51 +230,61 @@ function setDescription(parts) {
 }
 
 function renderReview() {
+    replayStatus.textContent = "";
+
     if (pending) {
-        const agree = pending.sources.includes("camera") && pending.sources.includes("ir");
-        const parts = pending.sources.map((s) => [SOURCE_LABELS[s] + ".", s === "camera" ? "ok" : null]);
+        const evaluating = pending.phase === "evaluating";
+        const title = evaluating ? "Evaluating Evidence" : pending.manual ? "Manual Review" : "Awaiting Decision";
+        const reason = evaluating
+            ? "IR interruption detected. Checking the camera footage for a soccer ball..."
+            : AWAIT_REASONS[pending.reason] || "Waiting for the referee's decision.";
 
-        if (pending.camera) {
-            parts.push([CAMERA_EVIDENCE[pending.camera] + ".", CAMERA_EVIDENCE_STATUS[pending.camera] || null]);
-        }
-
-        parts.push([(agree ? "Camera and IR agree. " : "") +
-            (pending.camera ? "The camera is supporting evidence only. " : "") +
-            "Review the footage before deciding." +
-            ` Detected at ${new Date(pending.time).toLocaleTimeString()}.`, null]);
-
-        setStatus(reviewStatus, "Pending", null);
-        setStatus(decisionTitle, `Possible Goal - Event #${pending.number}`, null);
-        setDescription(parts);
-        eventTag.textContent = "Review Required";
+        setStatus(decisionTitle, `${title} - Event #${pending.number}`, evaluating ? null : "wait");
+        setDescription([
+            [reason, null],
+            [pending.manual ? "Manual event." : `Automatic event, triggered by ${sourcesText(pending.sources)}.`, null],
+            ...cameraParts(pending),
+            [`Detected at ${new Date(pending.time).toLocaleTimeString()}.`, null]
+        ]);
+        eventTag.textContent = evaluating ? "Automatic Check" : "Awaiting Decision";
         return;
     }
 
-    setStatus(reviewStatus, "Ready", "ok");
-    replayStatus.textContent = "";
-
-    if (state.history.length > 0) {
-        const last = state.history[0];
-        const goal = last.decision === "GOAL";
-
-        setStatus(decisionTitle, goal ? "Goal Confirmed" : "No Goal", goal ? "ok" : "bad");
-        decisionDescription.textContent =
-            `Event #${last.number} reviewed at ${new Date(last.time).toLocaleTimeString()}.`;
-        eventTag.textContent = "Reviewed";
-    } else {
+    if (state.history.length === 0) {
         setStatus(decisionTitle, "No Pending Review", null);
         decisionDescription.textContent = "Waiting for a goal-line event.";
         eventTag.textContent = "Waiting";
+        return;
     }
+
+    // The most recent decision, including a correction of an older automatic goal.
+    const last = state.history.reduce((a, b) => (b.time > a.time ? b : a));
+    const time = ` Event #${last.number}, ${new Date(last.time).toLocaleTimeString()}.`;
+
+    if (last.corrected) {
+        setStatus(decisionTitle, "No Goal", "bad");
+        setDescription([["Automatic goal overturned by the referee." + time, null]]);
+    } else if (last.auto) {
+        setStatus(decisionTitle, "Automatic Goal", "ok");
+        setDescription([["IR interruption and confident soccer ball detection." + time, null],
+            ...cameraParts(last)]);
+    } else if (last.decision === "GOAL") {
+        setStatus(decisionTitle, "Goal", "ok");
+        setDescription([["Confirmed by referee." + time, null]]);
+    } else {
+        setStatus(decisionTitle, "No Goal", "bad");
+        setDescription([["Rejected by referee." + time, null]]);
+    }
+    eventTag.textContent = last.auto ? "Automatic" : "Referee";
 }
 
 function renderReplay(board) {
     const replay = state && state.replay;
-    const canControl = socket.connected && board.connected && pending;
+    const canControl = socket.connected && board.connected && replayEvent;
 
-    replayControls.hidden = !pending;
+    replayControls.hidden = !replayEvent;
 
-    if (!pending) {
+    if (!replayEvent) {
         return;
     }
 
@@ -242,17 +315,19 @@ function renderReplay(board) {
 }
 
 function replayMessage() {
-    if (pending.cameraReplay === "pending") {
+    const event = replayEvent;
+
+    if (event.cameraReplay === "pending") {
         return "Waiting for the camera replay...";
     }
 
-    if (pending.cameraReplay === "unavailable") {
-        return pending.camera === "ignored"
+    if (event.cameraReplay === "unavailable") {
+        return event.camera === "ignored"
             ? "Replay unavailable: the camera ignored this trigger"
             : "Replay unavailable for this event";
     }
 
-    return pending.cameraReplay === "ready" ? "Loading replay..." : "No replay footage for this event";
+    return event.cameraReplay === "ready" ? "Loading replay..." : "No replay footage for this event";
 }
 
 // The server relays the board's stream at /camera/stream. A new query string
@@ -294,8 +369,8 @@ function drawCamera() {
 
     if (!socket.connected) {
         message = "Server Disconnected";
-    } else if (pending) {
-        tag = "Recorded Replay";
+    } else if (replayEvent) {
+        tag = viewing ? "Automatic Goal Replay" : "Recorded Replay";
         frame = replayFrame;
         message = replayMessage();
     } else if (!board.connected) {
@@ -439,13 +514,15 @@ function showHistory(history) {
         const decision = document.createElement("span");
         decision.textContent = event.decision;
         decision.className = event.decision === "GOAL" ? "ok" : "bad";
-        label.append(`Event #${event.number} - `, decision, ` (${sourcesText(event.sources)}`);
+        const how = event.corrected ? "automatic, corrected by referee" : event.auto ? "automatic" : "referee";
+        const type = event.manual ? "manual review" : sourcesText(event.sources);
+        label.append(`Event #${event.number} - `, decision, ` - ${how} (${type}`);
 
         if (event.camera && event.camera !== "pending") {
             const camera = document.createElement("span");
-            camera.textContent = { seen: "camera: ball seen", missed: "camera: no ball" }[event.camera] ||
-                "camera: no result";
-            camera.className = CAMERA_EVIDENCE_STATUS[event.camera];
+            const best = event.confidence && event.confidence.best > 0 ? ` ${event.confidence.best}%` : "";
+            camera.textContent = `camera: ${CAMERA_EVIDENCE[event.camera][0]}${best}`;
+            camera.className = CAMERA_EVIDENCE[event.camera][1] || "";
             label.append("; ", camera);
         }
 
@@ -475,6 +552,18 @@ function decide(result) {
 
 confirmBtn.addEventListener("click", () => decide("GOAL"));
 rejectBtn.addEventListener("click", () => decide("NO GOAL"));
+
+viewBtn.addEventListener("click", () => {
+    const auto = latestAutoGoal();
+    socket.emit("view", viewing || !auto ? null : { id: auto.id });
+});
+
+correctBtn.addEventListener("click", () => {
+    const auto = latestAutoGoal();
+    if (auto && window.confirm(`Change Event #${auto.number} from an automatic goal to No Goal?`)) {
+        socket.emit("correct", { id: auto.id });
+    }
+});
 
 prevBtn.addEventListener("click", () => socket.emit("replay", { action: "prev" }));
 nextBtn.addEventListener("click", () => socket.emit("replay", { action: "next" }));

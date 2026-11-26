@@ -1,14 +1,14 @@
 #ifndef BUZZER_H
 #define BUZZER_H
 
-// Passive buzzer on GPIO25, driven by a software square wave.
+// Buzzer on GPIO25 (through an NPN transistor). Settings are at the top of buzzer.cpp.
 namespace buzzer {
 
 bool init();
 
-// Non-blocking: plays the short goal chime once (see buzzer.cpp for the
-// notes). Ignored while the chime is already playing.
-void chime();
+// Non-blocking: plays the referee whistle (PIP - PIP - PIIIIIP) once.
+// Ignored while it is already playing.
+void whistle();
 
 bool active();
 

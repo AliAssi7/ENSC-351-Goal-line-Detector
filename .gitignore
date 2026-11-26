@@ -1,3 +1,4 @@
 build/
 *.onnx
 replays/
+__pycache__/

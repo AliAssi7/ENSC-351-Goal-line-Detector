@@ -27,9 +27,20 @@
 #include <iostream>
 #include <mutex>
 #include <set>
+#include <sstream>
 #include <thread>
 
 namespace goalcam {
+
+// Automatic-goal thresholds: initial tuning values, not validated accuracy.
+// The model runs about 3 times a second on the board, so a ball rolling past
+// is only in a few runs; the window includes footage from before the trigger.
+static const double kAutoConfidence = 0.75;
+static const int kMinBallRuns = 2;          // distinct runs with a confident ball
+static const int kMinRuns = 3;              // runs needed in the window to judge at all
+static const int kMinBallMovePx = 40;       // a ball that crossed the line moves; a parked one does not
+static const int kWindowBeforeMs = 1500;    // window around the beam break
+static const int kWindowAfterMs = 1000;
 
 static Config config;
 static Callbacks callbacks;
@@ -41,6 +52,8 @@ struct Pending {
     std::string id;
     long long since = 0;
     time_t sentAt = 0;
+    int breakOffsetMs = 0;
+    Evidence details;
     bool acknowledged = false;
     bool accepted = false;
     bool clipDone = true;
@@ -179,18 +192,96 @@ static bool clipTime(const std::string& name, time_t& t)
     return t != -1;
 }
 
-static void report(const std::string& id, const std::string& evidence, const std::string& replay)
+static void report(const std::string& id, const Evidence& evidence, const std::string& replay)
 {
     if (callbacks.evidence)
         callbacks.evidence(id, evidence, replay);
 }
 
-bool capture(const std::string& eventId)
+Evidence evaluate(const std::vector<Inference>& runs, int breakOffsetMs)
+{
+    Evidence e;
+    std::set<int> counted;
+    bool anyBall = false;
+    std::vector<const Inference*> confident;
+
+    e.measured = true;
+
+    for (const Inference& run : runs)
+    {
+        int t = run.dtMs + breakOffsetMs;   // relative to the beam break
+
+        // The same run listed twice is only counted once.
+        if (!counted.insert(run.dtMs).second || t < -kWindowBeforeMs || t > kWindowAfterMs)
+            continue;
+
+        ++e.runs;
+        e.best = std::max(e.best, run.confidence);
+
+        if (run.confidence > 0)
+        {
+            e.firstMs = anyBall ? std::min(e.firstMs, t) : t;
+            e.lastMs = anyBall ? std::max(e.lastMs, t) : t;
+            anyBall = true;
+        }
+
+        if (run.confidence >= kAutoConfidence)
+        {
+            ++e.ballRuns;
+            if (run.hasPosition)
+                confident.push_back(&run);
+        }
+    }
+
+    // Largest distance between two confident detections; no position, no movement.
+    for (const Inference* a : confident)
+        for (const Inference* b : confident)
+            e.movePx = std::max(e.movePx, int(std::hypot(a->x - b->x, a->y - b->y)));
+
+    if (e.runs < kMinRuns)
+        e.result = "insufficient";
+    else if (e.ballRuns >= kMinBallRuns)
+        e.result = e.movePx >= kMinBallMovePx ? "confident" : "stationary";
+    else
+        e.result = anyBall ? "low" : "none";
+
+    return e;
+}
+
+bool parseEvidence(const std::string& line, std::vector<Inference>& runs)
+{
+    std::istringstream in(line);
+    std::string word;
+    runs.clear();
+
+    if (!(in >> word) || word != "EVIDENCE")
+        return false;
+
+    while (in >> word)
+    {
+        Inference run;
+        int used = 0;
+        int fields = std::sscanf(word.c_str(), "%d:%lf%n:%d:%d%n", &run.dtMs, &run.confidence,
+                                 &used, &run.x, &run.y, &used);
+
+        if ((fields != 2 && fields != 4) || used != int(word.size()) ||
+            !(run.confidence >= 0 && run.confidence <= 1))
+            return false;
+
+        run.hasPosition = fields == 4;
+        runs.push_back(run);
+    }
+
+    return true;
+}
+
+bool capture(const std::string& eventId, int breakOffsetMs)
 {
     {
         std::lock_guard<std::mutex> lock(mutex);
         pending = Pending();
         pending.id = eventId;
+        pending.breakOffsetMs = breakOffsetMs;
         pending.since = nowMs();
         pending.sentAt = time(nullptr);
         pending.clipDone = false;
@@ -214,8 +305,9 @@ bool capture(const std::string& eventId)
 }
 
 // goal_cam.py's output is for people, so anything unrecognised is ignored.
-// A YES/NO only counts after goal_cam.py has accepted this event's trigger,
-// so a late line from the previous replay is never attributed to it.
+// EVIDENCE or YES/NO only count after goal_cam.py has accepted this event's
+// trigger, so a late line from the previous replay is never attributed to it.
+// EVIDENCE is printed before YES/NO, and the first answer wins.
 static void parseLine(const std::string& line)
 {
     auto has = [&](const char* text) { return line.find(text) != std::string::npos; };
@@ -241,7 +333,8 @@ static void parseLine(const std::string& line)
         hinted = true;
     }
 
-    std::string id, evidence, replay;
+    std::string id, replay;
+    Evidence evidence;
 
     {
         std::lock_guard<std::mutex> lock(mutex);
@@ -266,6 +359,20 @@ static void parseLine(const std::string& line)
                 p.accepted = has("GOAL trigger");
             }
         }
+        else if (p.accepted && p.evidence == "pending" && line.rfind("EVIDENCE", 0) == 0)
+        {
+            std::vector<Inference> runs;
+
+            if (parseEvidence(line, runs))
+            {
+                p.details = evaluate(runs, p.breakOffsetMs);
+                p.evidence = p.details.result;
+            }
+            else
+            {
+                std::cerr << "Ignoring malformed EVIDENCE line from goal_cam.py\n";
+            }
+        }
         else if (p.accepted && p.evidence == "pending" && has("camera saw the ball: YES"))
         {
             p.evidence = "seen";
@@ -276,7 +383,7 @@ static void parseLine(const std::string& line)
         }
         else if (p.accepted && !p.clipDone && has("not enough video"))
         {
-            p.evidence = "unavailable";
+            p.evidence = "insufficient";
             p.replay = "unavailable";
             p.clipDone = true;
         }
@@ -285,7 +392,8 @@ static void parseLine(const std::string& line)
             return;
 
         id = p.id;
-        evidence = p.evidence;
+        evidence = p.details;
+        evidence.result = p.evidence;
         replay = p.replay;
     }
 
@@ -294,7 +402,9 @@ static void parseLine(const std::string& line)
 
 static void checkClip()
 {
-    std::string id, evidence;
+    std::string id;
+    Evidence evidence;
+    bool timedOut = false;
     std::set<std::string> known;
     time_t sentAt;
     bool accepted;
@@ -312,7 +422,9 @@ static void checkClip()
             p.replay = "unavailable";
             if (p.evidence == "pending")
                 p.evidence = "unavailable";
-            evidence = p.evidence;
+            evidence = p.details;
+            evidence.result = p.evidence;
+            timedOut = true;
         }
 
         id = p.id;
@@ -321,7 +433,7 @@ static void checkClip()
         accepted = p.accepted;
     }
 
-    if (!evidence.empty())
+    if (timedOut)
     {
         std::cerr << "No goal_cam replay for event " << id << "\n";
         report(id, evidence, "unavailable");
