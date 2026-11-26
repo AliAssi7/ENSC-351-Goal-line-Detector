@@ -50,7 +50,7 @@ const CAMERA_EVIDENCE = {
     ignored: "Camera (YOLO): trigger ignored during the camera's 3 s cooldown",
     unavailable: "Camera (YOLO): detection result unavailable"
 };
-const IR_LABELS = { ok: "Online", error: "Error", disabled: "Disabled", offline: "Offline" };
+const IR_LABELS = { ok: "Online", degraded: "Degraded", error: "Error", disabled: "Disabled", offline: "Offline" };
 const OK_CAMERA = ["yolo", "live", "sim", "file"];
 const CAMERA_EVIDENCE_STATUS = { seen: "ok", missed: "bad", ignored: "bad", unavailable: "bad" };
 
@@ -61,13 +61,18 @@ let replayFrame = null;
 let calibration = null;
 let sliding = false;
 let streamFailed = false;
+let streamAttempt = 0;
 let drawSequence = 0;
+let decidedId = null;   // stops a double click sending two decisions
 
 simulateBtn.disabled = true;
 confirmBtn.disabled = true;
 rejectBtn.disabled = true;
 
-socket.on("connect", render);
+socket.on("connect", () => {
+    decidedId = null;
+    render();
+});
 
 socket.on("disconnect", () => {
     liveFrame = null;
@@ -109,7 +114,7 @@ function render() {
     if (!socket.connected) {
         setStatus(systemStatus, "Server Disconnected", "bad");
     } else if (!board.connected) {
-        setStatus(systemStatus, "Demo Mode - BeagleY-AI Disconnected", "bad");
+        setStatus(systemStatus, "BeagleY-AI Disconnected", "bad");
     } else {
         const modes = { monitoring: "Monitoring", review: "Reviewing", goal: "Goal Confirmed" };
         setStatus(systemStatus, `BeagleY-AI Connected - ${modes[board.state] || "Starting"}`, "ok");
@@ -120,14 +125,16 @@ function render() {
         setStatus(cameraStatus, "Disconnected", "bad");
     } else {
         setStatus(irStatus, IR_LABELS[board.ir] || "Starting",
-            board.ir === "ok" ? "ok" : ["error", "offline"].includes(board.ir) ? "bad" : null);
+            board.ir === "ok" ? "ok" : ["degraded", "error", "offline"].includes(board.ir) ? "bad" : null);
         setStatus(cameraStatus, CAMERA_LABELS[board.camera] || "Starting",
             OK_CAMERA.includes(board.camera) ? "ok" : board.camera === "offline" ? "bad" : null);
     }
 
-    simulateBtn.disabled = !connected || pending !== null;
-    confirmBtn.disabled = !connected || pending === null;
-    rejectBtn.disabled = !connected || pending === null;
+    const deciding = pending !== null && pending.id === decidedId;
+
+    simulateBtn.disabled = !connected || !board.connected || pending !== null;
+    confirmBtn.disabled = !connected || pending === null || deciding;
+    rejectBtn.disabled = !connected || pending === null || deciding;
 
     if (connected) {
         goalCount.textContent = state.goals;
@@ -200,7 +207,7 @@ function renderReview() {
 
 function renderReplay(board) {
     const replay = state && state.replay;
-    const canControl = socket.connected && board.connected && pending && !pending.local;
+    const canControl = socket.connected && board.connected && pending;
 
     replayControls.hidden = !pending;
 
@@ -209,7 +216,7 @@ function renderReplay(board) {
     }
 
     if (!replay || replay.frames === 0) {
-        replayLabel.textContent = pending.local ? "Demo event - no footage" : "No replay footage";
+        replayLabel.textContent = "No replay footage";
         replayStatus.textContent = "";
         replaySlider.max = 0;
         replaySlider.value = 0;
@@ -235,10 +242,6 @@ function renderReplay(board) {
 }
 
 function replayMessage() {
-    if (pending.local) {
-        return "Demo event - no camera footage";
-    }
-
     if (pending.cameraReplay === "pending") {
         return "Waiting for the camera replay...";
     }
@@ -252,10 +255,12 @@ function replayMessage() {
     return pending.cameraReplay === "ready" ? "Loading replay..." : "No replay footage for this event";
 }
 
+// The server relays the board's stream at /camera/stream. A new query string
+// on every attach stops the browser reusing a stale cached image.
 function showStream(url) {
     if (url && cameraStream.dataset.src !== url) {
         cameraStream.dataset.src = url;
-        cameraStream.src = url;
+        cameraStream.src = `/camera/stream?n=${++streamAttempt}`;
     } else if (!url && cameraStream.dataset.src) {
         // Closing the connection stops goal_cam.py encoding frames for us.
         cameraStream.removeAttribute("src");
@@ -338,7 +343,8 @@ function drawCamera() {
     } else if (stream && board.cameraStats) {
         const stats = board.cameraStats;
         cameraInfo.textContent =
-            `Camera stream - ${stats.fps} fps, model ${stats.modelMs} ms, ball: ${stats.ball ? "yes" : "no"}`;
+            `Camera stream - ${stats.fps} fps, model ${stats.modelMs} ms, ball: ${stats.ball ? "yes" : "no"}` +
+            ` - ${new URL(board.stream).host}`;
     } else {
         cameraInfo.textContent = "BeagleY-AI";
     }
@@ -459,23 +465,16 @@ simulateBtn.addEventListener("click", () => {
     }
 });
 
-confirmBtn.addEventListener("click", () => {
-    if (socket.connected && pending) {
-        socket.emit("decision", {
-            id: pending.id,
-            result: "GOAL"
-        });
+function decide(result) {
+    if (socket.connected && pending && pending.id !== decidedId) {
+        decidedId = pending.id;
+        socket.emit("decision", { id: pending.id, result });
+        render();
     }
-});
+}
 
-rejectBtn.addEventListener("click", () => {
-    if (socket.connected && pending) {
-        socket.emit("decision", {
-            id: pending.id,
-            result: "NO GOAL"
-        });
-    }
-});
+confirmBtn.addEventListener("click", () => decide("GOAL"));
+rejectBtn.addEventListener("click", () => decide("NO GOAL"));
 
 prevBtn.addEventListener("click", () => socket.emit("replay", { action: "prev" }));
 nextBtn.addEventListener("click", () => socket.emit("replay", { action: "next" }));

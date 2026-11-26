@@ -20,8 +20,9 @@
 // Another source within 5 s is added to the same event as corroboration.
 // Nothing is awarded automatically: only the referee's decision sets GOAL.
 //
-// LEDs: green = operational or goal confirmed, red = fault (IR error or
-// camera offline) or no goal, both off = review pending.
+// LEDs: green for 3 s after a confirmed goal (with the buzzer chime), red for
+// 3 s after a rejected one, otherwise both off. Goal returns to Monitoring
+// after the same 3 s.
 namespace controller {
 
 enum class State { Monitoring, Review, Goal };

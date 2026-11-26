@@ -27,10 +27,26 @@ struct Line {
     Clock::time_point lastRise{};
     Clock::time_point lastFall{};
     Clock::time_point burstStart{};
+    std::vector<gpio_mock::Burst> log;
 };
 
 std::mutex mutex;
 std::vector<Line> lines;
+std::vector<std::string> broken;
+const Clock::time_point epoch = Clock::now();
+
+bool isBroken(const std::string& name)
+{
+    for (const std::string& b : broken)
+        if (b == name)
+            return true;
+    return false;
+}
+
+long long sinceEpochUs(Clock::time_point t)
+{
+    return std::chrono::duration_cast<std::chrono::microseconds>(t - epoch).count();
+}
 
 Line* find(const char* name)
 {
@@ -48,7 +64,10 @@ Line* byFd(int fd)
 
 int add(const char* name, int value, bool output)
 {
-    lines.push_back({name, value, output, true, 0});
+    if (isBroken(name))
+        return -1;
+
+    lines.push_back(Line{name, value, output, true, 0, 0, 0, {}, {}, {}, {}});
     return static_cast<int>(lines.size()) + 2;
 }
 
@@ -73,7 +92,7 @@ int get(int fd)
     std::lock_guard<std::mutex> lock(mutex);
     Line* line = byFd(fd);
 
-    if (!line)
+    if (!line || isBroken(line->name))
         return -1;
 
     // Lets a script drive inputs by writing 0/1 to <dir>/<line name>.
@@ -95,7 +114,7 @@ bool set(int fd, int value)
     std::lock_guard<std::mutex> lock(mutex);
     Line* line = byFd(fd);
 
-    if (!line || !line->output)
+    if (!line || !line->output || isBroken(line->name))
         return false;
 
     Clock::time_point now = Clock::now();
@@ -107,13 +126,22 @@ bool set(int fd, int value)
         {
             ++line->bursts;
             line->burstStart = now;
+            line->log.push_back({});
+            line->log.back().startUs = sinceEpochUs(now);
         }
         line->lastRise = now;
+        ++line->log.back().cycles;
     }
     else if (line->value && !value)
     {
-        line->highUs += std::chrono::duration_cast<std::chrono::microseconds>(now - line->lastRise).count();
+        long long high = std::chrono::duration_cast<std::chrono::microseconds>(now - line->lastRise).count();
+        line->highUs += high;
         line->lastFall = now;
+        if (!line->log.empty())
+        {
+            line->log.back().highUs += high;
+            line->log.back().endUs = sinceEpochUs(now);
+        }
     }
 
     if (line->value != value && std::getenv("TRUE_GOAL_GPIO_LOG"))
@@ -195,10 +223,30 @@ long long lastBurstMs(const char* name)
     return std::chrono::duration_cast<std::chrono::milliseconds>(line->lastFall - line->burstStart).count();
 }
 
+std::vector<Burst> burstLog(const char* name)
+{
+    std::lock_guard<std::mutex> lock(mutex);
+    Line* line = find(name);
+    return line ? line->log : std::vector<Burst>();
+}
+
+void setBroken(const char* name, bool on)
+{
+    std::lock_guard<std::mutex> lock(mutex);
+    std::vector<std::string> kept;
+    for (const std::string& b : broken)
+        if (b != name)
+            kept.push_back(b);
+    if (on)
+        kept.push_back(name);
+    broken = kept;
+}
+
 void reset()
 {
     std::lock_guard<std::mutex> lock(mutex);
     lines.clear();
+    broken.clear();
 }
 
 }

@@ -6,10 +6,12 @@
 #include "goalcam.h"
 #include "leds.h"
 #include "network.h"
+#include "pins.h"
 #include "replay.h"
 #include "sensors.h"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
@@ -20,6 +22,11 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
+
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 
 using controller::Source;
 
@@ -128,6 +135,97 @@ static void onFrame(std::shared_ptr<camera::Frame> frame)
     controller::cameraFrame(shared);
 }
 
+// Only one true_goal may own the GPIO lines, the camera and the server link.
+static bool lockInstance()
+{
+    const char* path = "/tmp/true_goal.lock";
+    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+
+    if (fd < 0)
+    {
+        std::cerr << "Warning: cannot open " << path << ": " << std::strerror(errno) << "\n";
+        return true;
+    }
+
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0)
+    {
+        char pid[16] = {};
+        if (read(fd, pid, sizeof(pid) - 1) < 0) {}
+        std::cerr << "True Goal is already running (PID " << std::atoi(pid) << ").\n"
+                  << "Stop it first with Ctrl+C in its terminal, or: kill " << std::atoi(pid) << "\n";
+        close(fd);
+        return false;
+    }
+
+    std::string text = std::to_string(getpid()) + "\n";
+    if (ftruncate(fd, 0) != 0 || write(fd, text.data(), text.size()) < 0) {}
+    return true;   // fd stays open, holding the lock until exit
+}
+
+static void sleepMs(int ms)
+{
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+}
+
+static int testLeds()
+{
+    bool ok = leds::init();
+
+    std::cout << "Green LED (" << pins::kLedGreen << ") on for 2 s\n";
+    ok &= leds::show(leds::Color::Green);
+    sleepMs(2000);
+
+    std::cout << "Red LED (" << pins::kLedRed << ") on for 2 s\n";
+    ok &= leds::show(leds::Color::Red);
+    sleepMs(2000);
+
+    ok &= leds::show(leds::Color::Off);
+    leds::cleanup();
+    std::cout << "Both LEDs off\n";
+    return ok ? 0 : 1;
+}
+
+static int testBuzzer()
+{
+    if (!buzzer::init())
+    {
+        std::cerr << "Buzzer unavailable\n";
+        return 1;
+    }
+
+    std::cout << "Playing the goal chime once\n";
+    buzzer::chime();
+
+    while (buzzer::active())
+        sleepMs(10);
+
+    buzzer::cleanup();
+    std::cout << "Buzzer off\n";
+    return 0;
+}
+
+static int testEncoder()
+{
+    bool started = encoder::start(
+        [](int step) { std::cout << (step > 0 ? "CLOCKWISE" : "COUNTERCLOCKWISE") << std::endl; },
+        [] { std::cout << "BUTTON PRESSED" << std::endl; });
+
+    if (!started)
+    {
+        std::cerr << "Rotary encoder unavailable\n";
+        return 1;
+    }
+
+    std::cout << "Turn or press the encoder. Ctrl+C to stop.\n";
+
+    while (running)
+        sleepMs(50);
+
+    encoder::stop();
+    std::cout << "Encoder released\n";
+    return 0;
+}
+
 static void usage()
 {
     std::cout <<
@@ -135,6 +233,7 @@ static void usage()
         "  --server HOST         computer running server.js (required)\n"
         "  --port N              board port on the server (default 4000)\n"
         "  --no-ir               do not run the IR sensors\n"
+        "  --skip-ir 18[,23]     do not use these IR sensors (GPIO numbers)\n"
         "\n"
         "Camera (default: the YOLO camera program goal_cam.py):\n"
         "  --goalcam-dir DIR     folder with goal_cam.py (default /root/ball)\n"
@@ -143,7 +242,9 @@ static void usage()
         "  --stream-port N       its MJPEG web port shown on the dashboard (default 8080)\n"
         "  --no-camera           run without any camera\n"
         "  --check-avi FILE      check that a goal_cam.py replay clip can be read, then exit\n"
-        "  --test-buzzer         sound the buzzer once (1 s) and exit\n"
+        "  --test-leds           light green, then red, for 2 s each and exit\n"
+        "  --test-buzzer         play the goal chime once and exit\n"
+        "  --test-encoder        print encoder turns and presses until Ctrl+C\n"
         "\n"
         "Built-in test camera instead of goal_cam.py (never use both on one device):\n"
         "  --sim                 simulated pitch and ball\n"
@@ -162,6 +263,10 @@ static void usage()
 
 int main(int argc, char* argv[])
 {
+#ifdef TRUE_GOAL_MOCK_GPIO
+    std::cerr << "*** Mock GPIO build: no real LEDs, buzzer, encoder or IR sensors are used ***\n";
+#endif
+
     std::string host;
     int port = 4000;
     int liveFps = 8;
@@ -173,6 +278,8 @@ int main(int argc, char* argv[])
     camera::Config cam;
     detector::BallColor color;
     std::string lineArg;
+    std::string hardwareTest;
+    std::vector<std::string> skipIr;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -181,24 +288,16 @@ int main(int argc, char* argv[])
         auto value = [&]() { return std::string(argv[++i]); };
         auto number = [&]() { return std::atoi(argv[++i]); };
 
-        if (arg == "--test-buzzer")
+        if (arg == "--test-leds" || arg == "--test-buzzer" || arg == "--test-encoder")
         {
-            if (!buzzer::init())
-            {
-                std::cerr << "Buzzer unavailable\n";
-                return 1;
-            }
-
-            std::cout << "Buzzer: 2000 Hz, 25% duty, 1 s\n";
-            buzzer::beep(1000);
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-            while (buzzer::active())
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
-            buzzer::cleanup();
-            std::cout << "Buzzer off\n";
-            return 0;
+            hardwareTest = arg;
+        }
+        else if (arg == "--skip-ir" && hasValue)
+        {
+            std::istringstream list(value());
+            std::string pin;
+            while (std::getline(list, pin, ','))
+                skipIr.push_back(pin.rfind("GPIO", 0) == 0 ? pin : "GPIO" + pin);
         }
         else if (arg == "--check-avi" && hasValue)
         {
@@ -250,11 +349,29 @@ int main(int argc, char* argv[])
         return 1;
     }
 
+    std::signal(SIGINT, onSignal);
+    std::signal(SIGTERM, onSignal);
+    std::signal(SIGPIPE, SIG_IGN);
+
+    if (!hardwareTest.empty())
+    {
+        if (!lockInstance())
+            return 1;
+        if (hardwareTest == "--test-leds")
+            return testLeds();
+        if (hardwareTest == "--test-buzzer")
+            return testBuzzer();
+        return testEncoder();
+    }
+
     if (host.empty())
     {
         usage();
         return 1;
     }
+
+    if (!lockInstance())
+        return 1;
 
     bool useGoalCam = !builtInCamera && !noCamera;
 
@@ -282,26 +399,25 @@ int main(int argc, char* argv[])
     goalDetector.setLine(line);
     goalDetector.setColor(color);
 
-    std::signal(SIGINT, onSignal);
-    std::signal(SIGTERM, onSignal);
-    std::signal(SIGPIPE, SIG_IGN);
-
     if (!leds::init())
-        std::cerr << "Status LEDs unavailable\n";
+        std::cerr << "Status LEDs not fully available\n";
 
     if (!buzzer::init())
         std::cerr << "Buzzer unavailable\n";
 
     replay::configure(cam.fps, 3000, 2000);
     controller::init(network::send, network::sendFrame, liveFps);
-    controller::setIrStatus(useIr ? "ok" : "disabled");
+    controller::setIrStatus(useIr ? "offline" : "disabled");
     if (noCamera)
         controller::setCameraStatus("disabled");
 
     network::start(host, port, onServerLine, [useGoalCam, builtInCamera, streamPort] {
         if (builtInCamera)
             network::send(lineMessage());
-        network::send(useGoalCam ? "STREAM " + std::to_string(streamPort) : "STREAM -");
+        // Our own address, since the server may only see a NAT address.
+        network::send(useGoalCam ? "STREAM " + std::to_string(streamPort) + " " +
+                                       network::localAddress()
+                                 : "STREAM -");
         controller::resync();
     });
 
@@ -330,27 +446,11 @@ int main(int argc, char* argv[])
         camera::start(cam, onFrame, controller::setCameraStatus);
     }
 
-    // runGoalDetection() blocks until a goal, so this thread is detached.
     if (useIr)
     {
-        std::thread([] {
-            while (running)
-            {
-                controller::setIrStatus("ok");
-
-                if (sensors::runGoalDetection() == 1)
-                {
-                    // The IR check reports a goal one second after the beam broke.
-                    long long now = nowMs();
-                    controller::detected(Source::Ir, now - 1000, now);
-                }
-                else
-                {
-                    controller::setIrStatus("error");
-                    std::this_thread::sleep_for(std::chrono::seconds(2));
-                }
-            }
-        }).detach();
+        sensors::start(skipIr,
+            [](long long brokenMs, long long now) { controller::detected(Source::Ir, brokenMs, now); },
+            controller::setIrStatus);
     }
 
     std::cout << "True Goal running, server " << host << ":" << port << "\n";
@@ -364,6 +464,7 @@ int main(int argc, char* argv[])
 
     std::cout << "Shutting down\n";
 
+    sensors::stop();
     goalcam::stop();
     camera::stop();
     encoder::stop();

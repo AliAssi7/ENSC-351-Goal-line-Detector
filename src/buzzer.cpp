@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <iostream>
 #include <mutex>
 #include <thread>
 
@@ -15,43 +16,84 @@
 namespace buzzer {
 
 using Clock = std::chrono::steady_clock;
+using std::chrono::microseconds;
+using std::chrono::milliseconds;
 
-// GPIO25 has no hardware PWM, so the passive buzzer gets a software square wave.
-static const int kFrequencyHz = 2000;
-static const int kDutyPercent = 25;
-static const auto kPeriod = std::chrono::microseconds(1000000 / kFrequencyHz);
-static const auto kHigh = kPeriod * kDutyPercent / 100;
+// Goal chime: tune these after listening to the buzzer.
+// A note with frequency 0 is a silence.
+struct Note {
+    int frequencyHz;
+    int ms;
+};
+
+static const Note kChime[] = {
+    {1200, 150},
+    {0,     80},
+    {1600, 200},
+};
+static const int kDutyPercent = 15;   // Lower is softer
 
 static int fd = -1;
 static std::atomic<bool> running{false};
 static bool sounding = false;
-static Clock::time_point offAt;
+static bool writeFailed = false;
 static std::mutex mutex;
 static std::condition_variable wakeup;
 static std::thread worker;
 
-// The short high phase is timed from the actual rising edge with a busy-wait,
-// so late wake-ups cannot shrink it. Rising edges follow absolute deadlines,
-// so they cannot lower the frequency either.
-static void tone(Clock::time_point end)
+static void setPin(int value)
 {
+    if (!gpio::set(fd, value) && !writeFailed)
+    {
+        writeFailed = true;
+        std::cerr << "Buzzer " << pins::kBuzzer << ": GPIO write failed\n";
+    }
+}
+
+// GPIO25 has no hardware PWM. The short high phase is a busy-wait so a late
+// wake-up cannot stretch it; the rest of each period sleeps.
+static void tone(int frequencyHz, Clock::time_point end)
+{
+    const microseconds period(1000000 / frequencyHz);
+    const microseconds high = period * kDutyPercent / 100;
     Clock::time_point next = Clock::now();
 
     while (running && next < end)
     {
-        gpio::set(fd, 1);
-        Clock::time_point fall = Clock::now() + kHigh;
+        setPin(1);
+        Clock::time_point fall = Clock::now() + high;
         while (Clock::now() < fall) {}
-        gpio::set(fd, 0);
+        setPin(0);
 
-        next += kPeriod;
+        next += period;
         std::this_thread::sleep_until(next < end ? next : end);
 
-        if (Clock::now() - next > kPeriod)
+        if (Clock::now() - next > period)
             next = Clock::now();
     }
 
-    gpio::set(fd, 0);
+    setPin(0);
+}
+
+static void play()
+{
+    for (const Note& note : kChime)
+    {
+        Clock::time_point end = Clock::now() + milliseconds(note.ms);
+
+        if (note.frequencyHz > 0)
+        {
+            tone(note.frequencyHz, end);
+        }
+        else
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            wakeup.wait_until(lock, end, [] { return !running; });
+        }
+
+        if (!running)
+            return;
+    }
 }
 
 static void run()
@@ -69,9 +111,8 @@ static void run()
         if (!running)
             break;
 
-        Clock::time_point end = offAt;
         lock.unlock();
-        tone(end);
+        play();
         lock.lock();
         sounding = false;
     }
@@ -89,22 +130,22 @@ bool init()
     if (fd < 0)
         return false;
 
+    writeFailed = false;
     running = true;
     worker = std::thread(run);
     return true;
 }
 
-void beep(int ms)
+void chime()
 {
     std::lock_guard<std::mutex> lock(mutex);
 
-    // A beep already in progress is not extended, so repeated calls cannot chain.
+    // A chime already playing is not restarted, so repeated calls cannot overlap.
     if (!running || sounding)
         return;
 
-    offAt = Clock::now() + std::chrono::milliseconds(ms);
     sounding = true;
-    wakeup.notify_one();
+    wakeup.notify_all();
 }
 
 bool active()
@@ -122,7 +163,7 @@ void cleanup()
             return;
 
         running = false;
-        wakeup.notify_one();
+        wakeup.notify_all();
     }
 
     worker.join();

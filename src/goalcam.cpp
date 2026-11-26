@@ -11,6 +11,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
+
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -224,8 +229,17 @@ static void parseLine(const std::string& line)
             callbacks.status("yolo");
     }
 
-    if ((has("cant open camera") || has("camera stopped giving frames")) && callbacks.status)
-        callbacks.status("offline");
+    if (has("cant open camera") || has("camera stopped giving frames"))
+    {
+        if (callbacks.status)
+            callbacks.status("offline");
+
+        static bool hinted = false;
+        if (!hinted)
+            std::cerr << "Camera not delivering frames. Check the USB webcam and that nothing "
+                         "else uses it: ls /dev/video*  and  fuser -v /dev/video*\n";
+        hinted = true;
+    }
 
     std::string id, evidence, replay;
 
@@ -369,6 +383,7 @@ static pid_t spawn(int& out)
 {
     // Prepared before fork: only async-signal-safe calls are allowed in the child.
     std::string shell = "export PYTHONUNBUFFERED=1; exec " + config.command;
+    pid_t parent = getpid();
     long maxFd = sysconf(_SC_OPEN_MAX);
     if (maxFd < 0 || maxFd > 4096)
         maxFd = 4096;
@@ -382,6 +397,17 @@ static pid_t spawn(int& out)
     if (pid == 0)
     {
         setpgid(0, 0);
+
+#ifdef __linux__
+        // If true_goal dies without cleaning up (kill -9, crash), the camera
+        // program is stopped too instead of keeping the webcam busy.
+        prctl(PR_SET_PDEATHSIG, SIGTERM);
+        if (getppid() != parent)
+            _exit(1);
+#else
+        (void)parent;
+#endif
+
         dup2(fds[1], STDOUT_FILENO);
         dup2(fds[1], STDERR_FILENO);
 
@@ -408,24 +434,53 @@ static pid_t spawn(int& out)
     return pid;
 }
 
-static void stopChild(pid_t pid)
+static bool waitChild(pid_t pid, int& status, int ms)
 {
-    kill(-pid, SIGINT);
-
-    for (int i = 0; i < 30; ++i)
+    for (int i = 0; i < ms / 50; ++i)
     {
-        if (waitpid(pid, nullptr, WNOHANG) == pid)
-            return;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (waitpid(pid, &status, WNOHANG) == pid)
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
+    return false;
+}
 
+// SIGINT lets goal_cam.py release the camera and finish its files; SIGTERM
+// and then SIGKILL follow if it does not exit. Returns the wait status.
+static int stopChild(pid_t pid)
+{
+    int status = 0;
+
+    if (waitpid(pid, &status, WNOHANG) == pid)
+        return status;
+
+    kill(-pid, SIGINT);
+    if (waitChild(pid, status, 3000))
+        return status;
+
+    kill(-pid, SIGTERM);
+    if (waitChild(pid, status, 1000))
+        return status;
+
+    std::cerr << "goal_cam.py did not stop, killing it\n";
     kill(-pid, SIGKILL);
-    waitpid(pid, nullptr, 0);
+    waitpid(pid, &status, 0);
+    return status;
+}
+
+static std::string describe(int status)
+{
+    if (WIFEXITED(status))
+        return "exit code " + std::to_string(WEXITSTATUS(status));
+    if (WIFSIGNALED(status))
+        return "signal " + std::to_string(WTERMSIG(status));
+    return "unknown status";
 }
 
 static void run()
 {
     bool warned = false;
+    int failures = 0;
 
     while (running)
     {
@@ -451,7 +506,8 @@ static void run()
 
             if (pid < 0)
             {
-                std::cerr << "Cannot start goal_cam.py\n";
+                std::cerr << "Cannot start goal_cam.py: " << std::strerror(errno) << "\n";
+                ++failures;
             }
             else
             {
@@ -492,17 +548,33 @@ static void run()
                 }
 
                 close(out);
-                stopChild(pid);
+                int status = stopChild(pid);
+                long long ranMs = nowMs() - started;
+
+                // A program that keeps failing at startup is retried less often.
+                failures = ranMs < 30000 ? failures + 1 : 0;
 
                 if (running)
-                    std::cerr << "goal_cam.py exited, restarting\n";
+                {
+                    std::cerr << "goal_cam.py stopped after " << ranMs / 1000 << " s ("
+                              << describe(status) << ")\n";
+
+                    if (WIFEXITED(status) && WEXITSTATUS(status) == 127)
+                        std::cerr << "Could not run \"" << config.command << "\" in " << config.dir
+                                  << ". Check --goalcam-dir and --goalcam-cmd.\n";
+                }
             }
 
             if (callbacks.status)
                 callbacks.status("offline");
         }
 
-        for (int i = 0; i < 50 && running; ++i)
+        int waitS = failures == 0 ? 5 : std::min(60, 5 << std::min(failures - 1, 4));
+
+        if (failures > 0 && running)
+            std::cerr << "Restarting goal_cam.py in " << waitS << " s\n";
+
+        for (int i = 0; i < waitS * 10 && running; ++i)
         {
             checkClip();
             std::this_thread::sleep_for(std::chrono::milliseconds(100));

@@ -1,7 +1,8 @@
 const test = require("node:test");
 const assert = require("node:assert");
+const http = require("http");
 const net = require("net");
-const { startServer } = require("../server");
+const { startServer, validCameraHost, streamUrl } = require("../server");
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -92,14 +93,14 @@ class Board {
     }
 }
 
-async function setup() {
-    const server = await startServer({ httpPort: 0, boardPort: 0 });
+async function setup(options = {}) {
+    const server = await startServer({ httpPort: 0, boardPort: 0, cameraHost: "", ...options });
     const dashboard = new Dashboard(server.httpPort);
     await dashboard.state(() => true, "initial update");
     return { server, dashboard };
 }
 
-test("demo mode works without the board", async () => {
+test("no simulated reviews without the board", async () => {
     const { server, dashboard } = await setup();
 
     try {
@@ -107,30 +108,16 @@ test("demo mode works without the board", async () => {
         assert.strictEqual(initial.board.connected, false);
         assert.strictEqual(initial.pending, null);
 
+        // Simulate Event needs the real board: nothing happens without it.
         dashboard.emit("simulateGoal");
-        const { pending } = await dashboard.state((s) => s.pending, "demo event");
-        assert.strictEqual(pending.local, true);
-        assert.deepStrictEqual(pending.sources, ["manual"]);
-        assert.strictEqual(pending.number, 1);
-
-        dashboard.emit("simulateGoal");
-        dashboard.emit("decision", { id: pending.id, result: "MAYBE" });
-        dashboard.emit("decision", { id: "other", result: "GOAL" });
+        dashboard.emit("decision", { id: "x", result: "GOAL" });
         dashboard.emit("decision", "nonsense");
         dashboard.emit("replay", { action: "next" });
-        await sleep(100);
-        assert.strictEqual(dashboard.latest.update.pending.id, pending.id);
-
-        dashboard.emit("decision", { id: pending.id, result: "GOAL" });
-        const decided = await dashboard.state((s) => !s.pending, "decision");
-        assert.strictEqual(decided.goals, 1);
-        assert.strictEqual(decided.history[0].decision, "GOAL");
-        assert.strictEqual(decided.history[0].number, 1);
-
-        dashboard.emit("decision", { id: pending.id, result: "GOAL" });
-        await sleep(100);
-        assert.strictEqual(dashboard.latest.update.goals, 1);
-        assert.strictEqual(dashboard.latest.update.history.length, 1);
+        await sleep(150);
+        const state = dashboard.latest.update;
+        assert.strictEqual(state.pending, null);
+        assert.strictEqual(state.goals, 0);
+        assert.strictEqual(state.history.length, 0);
     } finally {
         dashboard.close();
         server.close();
@@ -159,7 +146,6 @@ test("board events, replay and decisions", async () => {
         board.send("EVENT 1700-1 camera");
         let state = await dashboard.state((s) => s.pending, "camera event");
         assert.strictEqual(state.pending.id, "1700-1");
-        assert.strictEqual(state.pending.local, false);
 
         board.send("EVENT 1700-1 camera,ir");
         state = await dashboard.state((s) => s.pending.sources.length === 2, "IR evidence");
@@ -199,12 +185,18 @@ test("board events, replay and decisions", async () => {
         assert.strictEqual(second.latest.update.pending.id, "1700-1");
         second.close();
 
+        // A double click sends the decision twice: it is counted once.
+        dashboard.emit("decision", { id: "1700-1", result: "MAYBE" });
+        dashboard.emit("decision", { id: "1700-1", result: "GOAL" });
         dashboard.emit("decision", { id: "1700-1", result: "GOAL" });
         await board.take("DECISION 1700-1 GOAL");
         state = await dashboard.state((s) => !s.pending, "decision recorded");
         assert.strictEqual(state.goals, 1);
+        assert.strictEqual(state.history.length, 1);
         assert.deepStrictEqual(state.history[0].sources, ["camera", "ir"]);
         assert.strictEqual(state.replay, null);
+        await sleep(50);
+        assert.ok(!board.lines.some((l) => l.startsWith("DECISION")));
 
         dashboard.emit("decision", { id: "1700-1", result: "NO GOAL" });
         await sleep(100);
@@ -227,6 +219,16 @@ test("board events, replay and decisions", async () => {
         state = await dashboard.state((s) => s.history.length === 2, "second decision");
         assert.strictEqual(state.goals, 1);
         assert.strictEqual(state.history[0].decision, "NO GOAL");
+        assert.strictEqual(state.history[0].number, 2);
+
+        // Simulate Event while a review is pending does nothing.
+        board.send("EVENT 1700-3 ir");
+        await dashboard.state((s) => s.pending && s.pending.id === "1700-3", "third event");
+        dashboard.emit("simulateGoal");
+        await sleep(100);
+        assert.ok(!board.lines.includes("REVIEW"));
+        dashboard.emit("decision", { id: "1700-3", result: "NO GOAL" });
+        await board.take("DECISION 1700-3 NO_GOAL");
 
         // Calibration is validated before it reaches the board.
         dashboard.emit("calibrate", { x1: 10, y1: 0, x2: 10, y2: 100, gx: 50, gy: 50 });
@@ -366,6 +368,7 @@ test("invalid board data is rejected", async () => {
         board.send("EVENT 1-1 telepathy");
         board.send("EVENT 1-1");
         board.send("STATUS dancing live ok -");
+        board.send("STREAM 8080 not-an-ip");
         board.send("LINE 1 2 3");
         board.send("REPLAY 1-1 x 10 0 0");
         board.send("HELLO");
@@ -389,6 +392,141 @@ test("invalid board data is rejected", async () => {
         state = await dashboard.state((s) => !s.board.connected, "board marked disconnected");
         assert.strictEqual(state.pending, null);
     } finally {
+        dashboard.close();
+        server.close();
+    }
+});
+
+test("camera host validation and stream URL", () => {
+    for (const ok of ["192.168.137.76", "beagle.local", "BeagleY-AI", "fe80::1"]) {
+        assert.ok(validCameraHost(ok), ok);
+    }
+    for (const bad of ["", "http://192.168.137.76", "192.168.137.76:8080", "a b", "x/y", "-bad", undefined]) {
+        assert.ok(!validCameraHost(bad), String(bad));
+    }
+    assert.strictEqual(streamUrl("192.168.137.76", 8080), "http://192.168.137.76:8080/stream");
+    assert.strictEqual(streamUrl("fe80::1", 8080), "http://[fe80::1]:8080/stream");
+});
+
+test("camera address: CAMERA_HOST, then the board's own address, then the connection", async () => {
+    await assert.rejects(startServer({ httpPort: 0, boardPort: 0, cameraHost: "http://1.2.3.4:8080" }),
+        /Invalid CAMERA_HOST/);
+
+    // The regression: behind NAT the board connects from the server's own
+    // address (172.16.176.79 in testing); the board's reported IP must win.
+    let { server, dashboard } = await setup();
+    let board = new Board(server.boardPort);
+
+    try {
+        await board.ready;
+        board.send("STREAM 8080 192.168.137.76");
+        let state = await dashboard.state((s) => s.board.stream, "reported stream");
+        assert.strictEqual(state.board.stream, "http://192.168.137.76:8080/stream");
+
+        // An older board that does not report its address falls back to the connection.
+        board.send("STREAM 8080");
+        state = await dashboard.state((s) => s.board.stream.includes("127.0.0.1"), "fallback");
+        assert.strictEqual(state.board.stream, "http://127.0.0.1:8080/stream");
+
+        // After the board reconnects the stream is restored.
+        board.close();
+        await dashboard.state((s) => !s.board.connected && s.board.stream === null, "stream cleared");
+        board = new Board(server.boardPort);
+        await board.ready;
+        board.send("STREAM 8080 192.168.137.76");
+        await dashboard.state((s) => s.board.stream === "http://192.168.137.76:8080/stream", "restored");
+    } finally {
+        board.close();
+        dashboard.close();
+        server.close();
+    }
+
+    ({ server, dashboard } = await setup({ cameraHost: " 10.0.0.5 " }));
+    board = new Board(server.boardPort);
+
+    try {
+        await board.ready;
+        board.send("STREAM 8081 192.168.137.76");
+        const state = await dashboard.state((s) => s.board.stream, "override");
+        assert.strictEqual(state.board.stream, "http://10.0.0.5:8081/stream");
+    } finally {
+        board.close();
+        dashboard.close();
+        server.close();
+    }
+});
+
+function get(port, path) {
+    return new Promise((resolve, reject) => {
+        const req = http.get({ host: "127.0.0.1", port, path }, (res) => {
+            const chunks = [];
+            res.on("data", (c) => chunks.push(c));
+            res.on("end", () => resolve({ res, body: Buffer.concat(chunks), aborted: false }));
+            res.on("aborted", () => resolve({ res, body: Buffer.concat(chunks), aborted: true }));
+            res.on("error", () => resolve({ res, body: Buffer.concat(chunks), aborted: true }));
+        });
+        req.on("error", reject);
+    });
+}
+
+test("the server relays the camera stream", async () => {
+    // Stands in for goal_cam.py's MJPEG server: two parts, then it stops.
+    const camera = http.createServer((req, res) => {
+        if (req.url !== "/stream") {
+            res.writeHead(404).end();
+            return;
+        }
+        res.writeHead(200, { "Content-Type": "multipart/x-mixed-replace; boundary=frame" });
+        res.write("--frame\r\nContent-Type: image/jpeg\r\n\r\nJPEG1\r\n");
+        setTimeout(() => res.end("--frame\r\nContent-Type: image/jpeg\r\n\r\nJPEG2\r\n"), 50);
+    });
+    await new Promise((resolve) => camera.listen(0, "127.0.0.1", resolve));
+    const cameraPort = camera.address().port;
+
+    const { server, dashboard } = await setup();
+    const board = new Board(server.boardPort);
+
+    try {
+        // No stream known yet.
+        let reply = await get(server.httpPort, "/camera/stream?n=1");
+        assert.strictEqual(reply.res.statusCode, 503);
+
+        await board.ready;
+        board.send(`STREAM ${cameraPort} 127.0.0.1`);
+        await dashboard.state((s) => s.board.stream, "stream");
+
+        // The query string (a browser cache-buster) is not passed to the camera.
+        reply = await get(server.httpPort, "/camera/stream?n=2");
+        assert.strictEqual(reply.res.statusCode, 200);
+        assert.match(reply.res.headers["content-type"], /multipart\/x-mixed-replace/);
+        assert.strictEqual(reply.res.headers["cache-control"], "no-store");
+        assert.match(reply.body.toString(), /JPEG1[\s\S]*JPEG2/);
+        assert.ok(reply.aborted, "a finished camera stream ends abruptly so the browser retries");
+
+        // Camera unreachable: 502, and the server keeps running.
+        camera.close();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        reply = await get(server.httpPort, "/camera/stream?n=3");
+        assert.strictEqual(reply.res.statusCode, 502);
+    } finally {
+        camera.close();
+        board.close();
+        dashboard.close();
+        server.close();
+    }
+});
+
+test("IR degraded status is shown", async () => {
+    const { server, dashboard } = await setup();
+    const board = new Board(server.boardPort);
+
+    try {
+        await board.ready;
+        board.send("STATUS monitoring yolo degraded -");
+        const state = await dashboard.state((s) => s.board.ir === "degraded", "degraded IR");
+        assert.strictEqual(state.board.camera, "yolo");
+    } finally {
+        board.close();
         dashboard.close();
         server.close();
     }

@@ -39,6 +39,7 @@ static std::atomic<bool> running{false};
 static std::mutex mutex;
 static int sock = -1;
 static int wakePipe[2] = {-1, -1};
+static std::string localIp;
 static std::deque<std::string> textQueue;
 static size_t queuedText = 0;
 static Message slots[kSlots];
@@ -103,6 +104,23 @@ static int connectTo(const std::string& host, int port)
 
     freeaddrinfo(result);
     return fd;
+}
+
+// The board's own address on the link to the server, which is the one the
+// dashboard can reach (the server may see a NAT address instead).
+static std::string socketAddress(int fd)
+{
+    sockaddr_storage addr{};
+    socklen_t len = sizeof(addr);
+    char host[NI_MAXHOST] = "";
+
+    if (getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0 ||
+        getnameinfo(reinterpret_cast<sockaddr*>(&addr), len, host, sizeof(host),
+                    nullptr, 0, NI_NUMERICHOST) != 0)
+        return "";
+
+    std::string ip = host;
+    return ip.rfind("::ffff:", 0) == 0 ? ip.substr(7) : ip;
 }
 
 static void resetQueues()
@@ -279,6 +297,7 @@ static void run(std::string host, int port,
             std::lock_guard<std::mutex> lock(mutex);
             resetQueues();
             sock = fd;
+            localIp = socketAddress(fd);
         }
 
         std::cout << "Connected to dashboard server\n";
@@ -353,6 +372,12 @@ void sendFrame(int slot, const std::string& header, Bytes data)
     }
 
     wake();
+}
+
+std::string localAddress()
+{
+    std::lock_guard<std::mutex> lock(mutex);
+    return localIp;
 }
 
 bool connected()

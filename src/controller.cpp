@@ -12,8 +12,8 @@
 
 namespace controller {
 
-static const int kBeepMs = 1000;
-static const long long kGoalHoldMs = 5000;
+// How long the green (goal) or red (no goal) LED stays on after a decision.
+static const long long kNotifyMs = 3000;
 static const long long kEvidenceWindowMs = 5000;
 static const long long kStatusIntervalMs = 1000;
 
@@ -29,10 +29,9 @@ static int eventCount = 0;
 static std::string currentId;
 static std::vector<Source> sources;
 static long long eventStartMs = 0;
-static long long goalSince = -1;
-static long long rejectedUntil = 0;
-static leds::Color shownLeds = leds::Color::Off;
-static bool ledsShown = false;
+static long long goalUntil = 0;
+static leds::Color ledColor = leds::Color::Off;
+static long long ledOffAt = 0;
 
 static std::string cameraStatus = "starting";
 static std::string irStatus = "offline";
@@ -101,22 +100,12 @@ static void sendEvent()
     send("EVENT " + currentId + " " + list);
 }
 
-static void updateLeds(long long nowMs)
+// Green or red lights for kNotifyMs after a decision; otherwise both are off.
+static void showLeds(leds::Color color, long long nowMs)
 {
-    leds::Color color = leds::Color::Green;
-
-    if (current == State::Review)
-        color = leds::Color::Off;
-    else if (current == State::Monitoring &&
-             (nowMs < rejectedUntil || irStatus == "error" || cameraStatus == "offline"))
-        color = leds::Color::Red;
-
-    if (!ledsShown || color != shownLeds)
-    {
-        leds::show(color);
-        shownLeds = color;
-        ledsShown = true;
-    }
+    leds::show(color);
+    ledColor = color;
+    ledOffAt = nowMs + kNotifyMs;
 }
 
 static void startEvent(Source source, long long triggerMs, long long nowMs)
@@ -130,7 +119,7 @@ static void startEvent(Source source, long long triggerMs, long long nowMs)
     lastReplay.clear();
     lastReplayFrame = nullptr;
 
-    updateLeds(nowMs);
+    showLeds(leds::Color::Off, nowMs);
     sendEvent();
 
     cameraEvidenceState.clear();
@@ -144,13 +133,17 @@ static void startEvent(Source source, long long triggerMs, long long nowMs)
     }
 }
 
-static void monitor(long long nowMs, bool rejected)
+static void monitor()
 {
     current = State::Monitoring;
     currentId.clear();
     replay::clear();
-    rejectedUntil = rejected ? nowMs + kGoalHoldMs : 0;
-    updateLeds(nowMs);
+}
+
+static void reject(long long nowMs)
+{
+    monitor();
+    showLeds(leds::Color::Red, nowMs);
 }
 
 static void goal(long long nowMs)
@@ -158,9 +151,9 @@ static void goal(long long nowMs)
     current = State::Goal;
     currentId.clear();
     replay::clear();
-    updateLeds(nowMs);
-    buzzer::beep(kBeepMs);
-    goalSince = -1;
+    goalUntil = nowMs + kNotifyMs;
+    showLeds(leds::Color::Green, nowMs);
+    buzzer::chime();
 }
 
 void init(SendText text, SendFrame frame, int liveFps)
@@ -177,8 +170,8 @@ void init(SendText text, SendFrame frame, int liveFps)
         std::chrono::system_clock::now().time_since_epoch()).count()) + suffix;
 
     lastStatus.clear();
-    ledsShown = false;
-    monitor(0, false);
+    monitor();
+    showLeds(leds::Color::Off, 0);
 }
 
 void resync()
@@ -303,7 +296,7 @@ void message(const std::string& line, long long nowMs)
         if (result == "GOAL")
             goal(nowMs);
         else if (result == "NO_GOAL")
-            monitor(nowMs, true);
+            reject(nowMs);
     }
     else if (command == "REPLAY" && current == State::Review)
     {
@@ -348,15 +341,11 @@ void tick(long long nowMs)
 
     replay::tick(nowMs);
 
-    if (current == State::Goal)
-    {
-        if (goalSince < 0)
-            goalSince = nowMs;
-        else if (nowMs - goalSince >= kGoalHoldMs)
-            monitor(nowMs, false);
-    }
+    if (current == State::Goal && nowMs >= goalUntil)
+        monitor();
 
-    updateLeds(nowMs);
+    if (ledColor != leds::Color::Off && nowMs >= ledOffAt)
+        showLeds(leds::Color::Off, nowMs);
 
     std::string status = std::string("STATUS ") + stateName(current) + " " +
                          cameraStatus + " " + irStatus + " " +

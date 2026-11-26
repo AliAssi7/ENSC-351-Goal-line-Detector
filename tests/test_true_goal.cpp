@@ -7,7 +7,9 @@
 #include "gpio_mock.h"
 #include "leds.h"
 #include "network.h"
+#include "pins.h"
 #include "replay.h"
+#include "sensors.h"
 
 #include <algorithm>
 #include <atomic>
@@ -477,7 +479,8 @@ static void testController()
         },
         8);
 
-    checkLeds(1, 0);
+    // Both LEDs stay off at startup and while monitoring.
+    checkLeds(0, 0);
     CHECK(controller::state() == controller::State::Monitoring);
 
     // Live frames are throttled to the preview rate.
@@ -570,28 +573,31 @@ static void testController()
     CHECK(controller::state() == controller::State::Review);
     checkLeds(0, 0);
 
+    // Confirmed goal: green for 3 s and the chime (two tones) once.
     controller::message("DECISION " + id + " GOAL", 2000);
     checkLeds(1, 0);
     CHECK(controller::state() == controller::State::Goal);
     CHECK(buzzer::active());
-    sleepMs(1150);
+    sleepMs(800);
     CHECK(!buzzer::active() && gpio_mock::value("GPIO25") == 0);
 
     controller::message("DECISION " + id + " GOAL", 2100);
     controller::message("DECISION " + id + " NO_GOAL", 2100);
     controller::detected(controller::Source::Camera, 2100, 2100);
     sleepMs(50);
-    CHECK(gpio_mock::bursts("GPIO25") == 1);
+    CHECK(gpio_mock::bursts("GPIO25") == 2);
     CHECK(controller::state() == controller::State::Goal);
-
-    controller::tick(3000);
-    controller::tick(7900);
-    CHECK(controller::state() == controller::State::Goal);
-    controller::tick(8000);
-    CHECK(controller::state() == controller::State::Monitoring);
     checkLeds(1, 0);
 
-    // Manual review rejected: no beep, red for 5 s, then green.
+    controller::tick(3000);
+    controller::tick(4990);
+    CHECK(controller::state() == controller::State::Goal);
+    checkLeds(1, 0);
+    controller::tick(5000);
+    CHECK(controller::state() == controller::State::Monitoring);
+    checkLeds(0, 0);
+
+    // Manual review rejected: no sound, red for 3 s, then off.
     sent.clear();
     controller::message("REVIEW", 9000);
     std::string manual = controller::eventId();
@@ -601,25 +607,22 @@ static void testController()
     CHECK(controller::eventId() == manual && sent.count("EVENT") == 2);
     controller::message("DECISION " + manual + " NO_GOAL", 9100);
     checkLeds(0, 1);
-    controller::tick(14000);
+    CHECK(!buzzer::active());
+    controller::tick(12090);
     checkLeds(0, 1);
-    controller::tick(14100);
-    checkLeds(1, 0);
+    controller::tick(12100);
+    checkLeds(0, 0);
 
-    // Faults turn the LED red while monitoring.
+    // Sensor and camera faults are shown on the dashboard, not the LEDs.
     controller::setIrStatus("error");
-    controller::tick(14200);
-    checkLeds(0, 1);
-    controller::setIrStatus("ok");
-    controller::tick(14300);
-    checkLeds(1, 0);
     controller::setCameraStatus("offline");
-    controller::tick(14400);
-    checkLeds(0, 1);
+    controller::tick(14200);
+    checkLeds(0, 0);
+    controller::setIrStatus("ok");
     controller::setCameraStatus("sim");
     controller::tick(14500);
-    checkLeds(1, 0);
-    CHECK(gpio_mock::bursts("GPIO25") == 1);
+    checkLeds(0, 0);
+    CHECK(gpio_mock::bursts("GPIO25") == 2);
 
     // Late evidence for a closed event opens a new one instead.
     controller::detected(controller::Source::Ir, 9200, 9200);
@@ -641,14 +644,29 @@ static void testController()
         CHECK(controller::state() == controller::State::Monitoring);
         now += 10000;
     }
-    CHECK(gpio_mock::bursts("GPIO25") == 4);
+    CHECK(gpio_mock::bursts("GPIO25") == 8);
     CHECK(ids[0] != ids[1] && ids[1] != ids[2]);
+    checkLeds(0, 0);
 
-    // A review can start while the goal LED is still held.
+    // A review can start while the goal LED is still lit: the LED goes off.
     controller::detected(controller::Source::Camera, now, now);
     controller::message("DECISION " + controller::eventId() + " GOAL", now);
     controller::message("REVIEW", now + 100);
     checkLeds(0, 0);
+
+    // Rejected, then a quick new review confirmed: the new LED gets its own 3 s.
+    controller::message("DECISION " + controller::eventId() + " NO_GOAL", now + 200);
+    checkLeds(0, 1);
+    controller::message("REVIEW", now + 500);
+    checkLeds(0, 0);
+    controller::message("DECISION " + controller::eventId() + " GOAL", now + 1000);
+    checkLeds(1, 0);
+    controller::tick(now + 3500);
+    checkLeds(1, 0);
+    controller::tick(now + 4000);
+    checkLeds(0, 0);
+    sleepMs(800);
+    now += 10000;
 
     // Status heartbeat.
     sent.clear();
@@ -664,7 +682,7 @@ static void testController()
 
     buzzer::cleanup();
     leds::cleanup();
-    buzzer::beep(100);
+    buzzer::chime();
     leds::show(leds::Color::Red);
     controller::detected(controller::Source::Camera, now, now);
 }
@@ -677,7 +695,19 @@ static void waitForBuzzer()
     sleepMs(50);   // a gap, so the mock counts the next tone as a new burst
 }
 
-static void testPassiveBuzzer()
+static void checkTone(const gpio_mock::Burst& b, int hz, int ms)
+{
+    double lengthMs = (b.endUs - b.startUs) / 1000.0;
+    double duty = 100.0 * b.highUs / (b.cycles * 1e6 / hz);
+    std::cout << "Buzzer tone: " << b.cycles << " cycles in " << int(lengthMs) << " ms ("
+              << int(b.cycles * 1000 / std::max(1.0, lengthMs)) << " Hz), duty " << int(duty + 0.5) << "%\n";
+
+    CHECK(lengthMs >= ms - 10 && lengthMs <= ms + 2);
+    CHECK(b.cycles >= hz * ms / 1000 * 95 / 100 && b.cycles <= hz * ms / 1000 + 1);
+    CHECK(duty >= 12 && duty <= 22);
+}
+
+static void testBuzzerChime()
 {
     using std::chrono::steady_clock;
     gpio_mock::reset();
@@ -687,54 +717,210 @@ static void testPassiveBuzzer()
     sleepMs(200);
     CHECK(gpio_mock::value("GPIO25") == 0 && gpio_mock::rises("GPIO25") == 0 && !buzzer::active());
 
-    // beep() returns immediately; the tone lasts one second at 2000 Hz, 25% duty.
+    // chime() returns at once: 1200 Hz for 150 ms, 80 ms silence, 1600 Hz for 200 ms.
     auto start = steady_clock::now();
-    buzzer::beep(1000);
+    buzzer::chime();
     CHECK(steady_clock::now() - start < std::chrono::milliseconds(5));
     CHECK(buzzer::active());
     waitForBuzzer();
+    CHECK(steady_clock::now() - start < std::chrono::milliseconds(600));
 
-    int cycles = gpio_mock::rises("GPIO25");
-    double duty = 100.0 * gpio_mock::highTimeUs("GPIO25") / (cycles * 500.0);
-    long long length = gpio_mock::lastBurstMs("GPIO25");
-    std::cout << "Buzzer: " << cycles << " cycles in " << length << " ms ("
-              << cycles * 1000 / std::max(1LL, length) << " Hz), duty " << int(duty + 0.5) << "%\n";
-
-    CHECK(gpio_mock::bursts("GPIO25") == 1);
-    CHECK(length >= 995 && length <= 1010);
-    CHECK(cycles >= 1900 && cycles <= 2001);
-    CHECK(duty >= 20 && duty <= 32);
+    std::vector<gpio_mock::Burst> log = gpio_mock::burstLog("GPIO25");
+    CHECK(log.size() == 2);
+    if (log.size() == 2)
+    {
+        checkTone(log[0], 1200, 150);
+        checkTone(log[1], 1600, 200);
+        long long gapMs = (log[1].startUs - log[0].endUs) / 1000;
+        CHECK(gapMs >= 75 && gapMs <= 95);
+    }
     CHECK(gpio_mock::value("GPIO25") == 0 && !buzzer::active());
 
-    // Repeated activations while sounding neither extend nor restart the tone.
-    buzzer::beep(1000);
-    sleepMs(400);
-    buzzer::beep(1000);
-    sleepMs(400);
-    buzzer::beep(1000);
+    // Repeated requests while it plays neither overlap nor restart it.
+    buzzer::chime();
+    sleepMs(100);
+    buzzer::chime();
+    sleepMs(200);
+    buzzer::chime();
     waitForBuzzer();
-    CHECK(gpio_mock::bursts("GPIO25") == 2);
-    CHECK(gpio_mock::lastBurstMs("GPIO25") <= 1010);
+    log = gpio_mock::burstLog("GPIO25");
+    CHECK(log.size() == 4);
+    if (log.size() == 4)
+        CHECK(log[3].endUs - log[2].startUs < 450000);
 
     // A later, separate goal sounds again.
-    buzzer::beep(1000);
+    buzzer::chime();
     waitForBuzzer();
-    CHECK(gpio_mock::bursts("GPIO25") == 3);
+    CHECK(gpio_mock::burstLog("GPIO25").size() == 6);
 
-    // Shutdown in the middle of a tone stops it at once and leaves the pin low.
-    buzzer::beep(5000);
-    sleepMs(100);
-    CHECK(buzzer::active() && gpio_mock::bursts("GPIO25") == 4);
+    // Shutdown during a tone, or during the silence, stops at once with the pin low.
+    buzzer::chime();
+    sleepMs(50);
     start = steady_clock::now();
     buzzer::cleanup();
     CHECK(steady_clock::now() - start < std::chrono::milliseconds(20));
     CHECK(gpio_mock::value("GPIO25") == 0 && !gpio_mock::isOpen("GPIO25"));
-    CHECK(gpio_mock::lastBurstMs("GPIO25") < 200);
+    CHECK(gpio_mock::burstLog("GPIO25").size() == 7);
+
+    gpio_mock::reset();
+    CHECK(buzzer::init());
+    buzzer::chime();
+    sleepMs(185);
+    start = steady_clock::now();
+    buzzer::cleanup();
+    CHECK(steady_clock::now() - start < std::chrono::milliseconds(20));
+    CHECK(gpio_mock::burstLog("GPIO25").size() == 1 && gpio_mock::value("GPIO25") == 0);
 
     // No sound after shutdown or before init.
-    buzzer::beep(1000);
+    buzzer::chime();
     CHECK(!buzzer::active());
     buzzer::cleanup();
+
+    // An unavailable buzzer line is reported, not hidden.
+    gpio_mock::setBroken("GPIO25", true);
+    CHECK(!buzzer::init());
+    buzzer::chime();
+    CHECK(!buzzer::active());
+    gpio_mock::reset();
+}
+
+static void testLeds()
+{
+    gpio_mock::reset();
+    CHECK(leds::init());
+    checkLeds(0, 0);
+
+    CHECK(leds::show(leds::Color::Green));
+    checkLeds(1, 0);
+    CHECK(leds::show(leds::Color::Red));
+    checkLeds(0, 1);
+    CHECK(leds::show(leds::Color::Off));
+    checkLeds(0, 0);
+
+    // A write failure is reported.
+    gpio_mock::setBroken("GPIO5", true);
+    CHECK(!leds::show(leds::Color::Green));
+    gpio_mock::setBroken("GPIO5", false);
+    leds::cleanup();
+    checkLeds(0, 0);
+    CHECK(!gpio_mock::isOpen("GPIO5") && !gpio_mock::isOpen("GPIO26"));
+
+    // One missing LED does not disable the other.
+    gpio_mock::reset();
+    gpio_mock::setBroken("GPIO26", true);
+    CHECK(!leds::init());
+    CHECK(leds::show(leds::Color::Green));
+    CHECK(gpio_mock::value("GPIO5") == 1);
+    leds::cleanup();
+    gpio_mock::reset();
+}
+
+// --- IR sensors and pins -----------------------------------------------------
+
+static void testBeamCheck()
+{
+    sensors::BeamCheck check;
+    int clear[3] = {1, 1, 1};
+    int beam2[3] = {1, 0, 1};
+
+    CHECK(check.update(clear, 0) == -1);
+
+    // Broken, then clear 1 s later: a goal on that beam.
+    CHECK(check.update(beam2, 100) == -1);
+    CHECK(check.update(clear, 600) == -1);
+    CHECK(check.update(clear, 1099) == -1);
+    CHECK(check.update(clear, 1100) == 1);
+    CHECK(check.brokenAt() == 100);
+    CHECK(check.update(clear, 1200) == -1);
+
+    // Still blocked after 1 s: no goal until it clears and breaks again.
+    CHECK(check.update(beam2, 2000) == -1);
+    CHECK(check.update(beam2, 3000) == -1);
+    CHECK(check.update(clear, 3010) == -1);
+    CHECK(check.update(clear, 3100) == -1);
+    CHECK(check.update(beam2, 3200) == -1);
+    CHECK(check.update(clear, 4200) == 1);
+
+    // A beam blocked for over 5 s is ignored until it clears; the others still work.
+    int stuck[3] = {0, 1, 1};
+    int stuckAnd3[3] = {0, 1, 0};
+    CHECK(check.update(stuck, 5000) == -1);
+    CHECK(check.update(stuck, 6000) == -1);
+    CHECK(check.update(stuck, 10001) == -1);
+    CHECK(check.stuck(0));
+    CHECK(check.update(stuckAnd3, 10100) == -1);
+    CHECK(check.update(stuck, 11100) == 2);
+    CHECK(check.update(clear, 11200) == -1);
+    CHECK(!check.stuck(0));
+
+    // Unavailable beams never trigger.
+    int missing[3] = {-1, -1, 1};
+    for (int t = 12000; t < 15000; t += 100)
+        CHECK(check.update(missing, t) == -1);
+}
+
+static void testIrThread()
+{
+    std::mutex m;
+    std::vector<std::string> statuses;
+    std::atomic<int> goals{0};
+    auto onGoal = [&](long long broken, long long now) { CHECK(now - broken >= 1000); ++goals; };
+    auto onStatus = [&](const std::string& s) { std::lock_guard<std::mutex> l(m); statuses.push_back(s); };
+    auto last = [&] { std::lock_guard<std::mutex> l(m); return statuses.empty() ? "" : statuses.back(); };
+
+    // GPIO18 unavailable: the other two still detect, and the status says degraded.
+    gpio_mock::reset();
+    gpio_mock::setBroken("GPIO18", true);
+    CHECK(sensors::start({}, onGoal, onStatus));
+    sleepMs(50);
+    CHECK(last() == "degraded");
+    gpio_mock::setInput("GPIO23", 0);
+    sleepMs(100);
+    gpio_mock::setInput("GPIO23", 1);
+    sleepMs(1100);
+    CHECK(goals == 1);
+
+    // A sensor failing while running is dropped once, without stopping the rest.
+    gpio_mock::setBroken("GPIO24", true);
+    sleepMs(50);
+    gpio_mock::setInput("GPIO23", 0);
+    sleepMs(100);
+    gpio_mock::setInput("GPIO23", 1);
+    sleepMs(1100);
+    CHECK(goals == 2 && last() == "degraded");
+
+    sensors::stop();
+    CHECK(!gpio_mock::isOpen("GPIO23") && !gpio_mock::isOpen("GPIO24"));
+    sensors::stop();
+
+    // Skipping the broken sensor: the remaining ones are all healthy.
+    gpio_mock::reset();
+    gpio_mock::setBroken("GPIO18", true);
+    CHECK(sensors::start({"GPIO18"}, onGoal, onStatus));
+    sleepMs(50);
+    CHECK(last() == "ok");
+    sensors::stop();
+
+    // None working, or all skipped.
+    gpio_mock::reset();
+    for (const char* pin : pins::kIrBeams)
+        gpio_mock::setBroken(pin, true);
+    CHECK(sensors::start({}, onGoal, onStatus));
+    sleepMs(50);
+    CHECK(last() == "error");
+    sensors::stop();
+    CHECK(!sensors::start({"GPIO18", "GPIO23", "GPIO24"}, onGoal, onStatus));
+    CHECK(last() == "disabled");
+    gpio_mock::reset();
+}
+
+static void testPinsDistinct()
+{
+    std::vector<std::string> all = {pins::kEncoderA, pins::kEncoderB, pins::kEncoderButton,
+                                    pins::kLedGreen, pins::kLedRed, pins::kBuzzer};
+    all.insert(all.end(), std::begin(pins::kIrBeams), std::end(pins::kIrBeams));
+    std::sort(all.begin(), all.end());
+    CHECK(std::adjacent_find(all.begin(), all.end()) == all.end());
 }
 
 // --- Camera -----------------------------------------------------------------
@@ -862,6 +1048,7 @@ static void testNetwork()
     CHECK(conn >= 0);
     sleepMs(100);
     CHECK(connects == 1 && network::connected());
+    CHECK(network::localAddress() == "127.0.0.1");
     CHECK(readLine(conn, 1000) == "HELLO");
 
     const char* msgs = "PING\nREVIEW\r\nDECISION a GO";
@@ -896,6 +1083,7 @@ static void testNetwork()
     // Silent link (no PING for 6 s): the board gives up and reconnects.
     int silent = conn;
     conn = acceptWithin(listener, 9000);
+    sleepMs(100);
     CHECK(conn >= 0 && connects == 3);
     close(silent);
 
@@ -1377,8 +1565,12 @@ int main()
     testEncoderThread();
     testDetector();
     testReplay();
+    testPinsDistinct();
+    testLeds();
     testController();
-    testPassiveBuzzer();
+    testBuzzerChime();
+    testBeamCheck();
+    testIrThread();
     testCamera();
     testNetwork();
     testAvi();

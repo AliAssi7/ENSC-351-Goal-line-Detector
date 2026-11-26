@@ -25,18 +25,17 @@ add_library(true_goal_core STATIC
     src/leds.cpp
     src/network.cpp
     src/replay.cpp
+    src/sensors.cpp
     ${GPIO_SOURCE}
 )
 target_include_directories(true_goal_core PUBLIC include)
 target_link_libraries(true_goal_core PUBLIC Threads::Threads)
 
-add_executable(true_goal
-    src/main.cpp
-    src/sensors.cpp
-)
+add_executable(true_goal src/main.cpp)
 target_link_libraries(true_goal PRIVATE true_goal_core)
 
 if(TRUE_GOAL_MOCK_GPIO)
+    target_compile_definitions(true_goal PRIVATE TRUE_GOAL_MOCK_GPIO)
     enable_testing()
     add_executable(true_goal_tests tests/test_true_goal.cpp)
     target_include_directories(true_goal_tests PRIVATE tests)

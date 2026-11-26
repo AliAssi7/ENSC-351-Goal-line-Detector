@@ -24,6 +24,9 @@ void sendFrame(int slot, const std::string& header,
                std::shared_ptr<const std::vector<uint8_t>> data);
 
 bool connected();
+
+// This board's IP address on the current server connection ("" if none).
+std::string localAddress();
 void stop();
 
 }

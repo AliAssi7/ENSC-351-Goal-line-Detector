@@ -10,12 +10,23 @@ const BOARD_STATES = ["monitoring", "review", "goal"];
 const CAMERA_STATES = ["yolo", "starting", "live", "file", "sim", "offline", "disabled"];
 const CAMERA_EVIDENCE = ["pending", "seen", "missed", "ignored", "unavailable"];
 const CAMERA_REPLAY = ["pending", "ready", "unavailable"];
-const IR_STATES = ["ok", "error", "disabled", "offline"];
+const IR_STATES = ["ok", "degraded", "error", "disabled", "offline"];
 const REPLAY_ACTIONS = { next: "NEXT", prev: "PREV", play: "PLAY", pause: "PAUSE" };
 const MAX_DIMENSION = 1920;
 const MAX_JPEG_BYTES = 4 * 1024 * 1024;
 const BOARD_TIMEOUT_MS = 6000;
 const MAX_DECIDED = 200;
+const CAMERA_TIMEOUT_MS = 5000;
+const HOSTNAME = /^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/;
+
+// CAMERA_HOST must be a bare IP address or host name, e.g. 192.168.137.76.
+function validCameraHost(host) {
+    return typeof host === "string" && (net.isIP(host) !== 0 || HOSTNAME.test(host));
+}
+
+function streamUrl(host, port) {
+    return `http://${net.isIPv6(host) ? `[${host}]` : host}:${port}/stream`;
+}
 
 function isInt(value, min, max) {
     return Number.isInteger(value) && value >= min && value <= max;
@@ -66,7 +77,15 @@ function parseFrameHeader(line) {
     };
 }
 
-function startServer({ httpPort = 3000, boardPort = 4000, host = "127.0.0.1" } = {}) {
+function startServer({ httpPort = 3000, boardPort = 4000, host = "127.0.0.1",
+                       cameraHost = process.env.CAMERA_HOST } = {}) {
+    cameraHost = (cameraHost || "").trim();
+
+    if (cameraHost && !validCameraHost(cameraHost)) {
+        return Promise.reject(new Error(
+            `Invalid CAMERA_HOST "${cameraHost}": use only the BeagleY-AI IP address, e.g. 192.168.137.76`));
+    }
+
     const app = express();
     const server = http.createServer(app);
     const io = new Server(server);
@@ -83,12 +102,43 @@ function startServer({ httpPort = 3000, boardPort = 4000, host = "127.0.0.1" } =
     // Decisions by event id, so a board that reconnects mid-review is told again.
     const decided = new Map();
     let nextNumber = 1;
-    let demoId = 1;
     let board = null;
+    let loggedStream = null;
     let liveFrame = null;
     let replayFrame = null;
 
     app.use(express.static(path.join(__dirname, "dashboard")));
+
+    // The browser always loads the camera from here, so it never needs the
+    // board's address and a refresh or reconnect always gets the current one.
+    app.get("/camera/stream", (req, res) => {
+        const url = state.board.stream;
+
+        if (!url) {
+            res.status(503).end();
+            return;
+        }
+
+        const upstream = http.get(url, (camera) => {
+            res.writeHead(camera.statusCode, {
+                "Content-Type": camera.headers["content-type"] || "application/octet-stream",
+                "Cache-Control": "no-store"
+            });
+            // When the camera stops, end abruptly so the browser reports an error and retries.
+            camera.pipe(res, { end: false });
+            camera.on("end", () => res.destroy());
+        });
+
+        upstream.setTimeout(CAMERA_TIMEOUT_MS, () => upstream.destroy());
+        upstream.on("error", () => {
+            if (res.headersSent) {
+                res.destroy();
+            } else {
+                res.status(502).end();
+            }
+        });
+        res.on("close", () => upstream.destroy());
+    });
 
     function broadcast() {
         io.emit("update", state);
@@ -100,22 +150,17 @@ function startServer({ httpPort = 3000, boardPort = 4000, host = "127.0.0.1" } =
         }
     }
 
-    function openEvent(id, sources, local) {
-        state.pending = { id, number: nextNumber++, sources, camera: null, cameraReplay: null, time: Date.now(), local };
+    function openEvent(id, sources) {
+        state.pending = { id, number: nextNumber++, sources, camera: null, cameraReplay: null, time: Date.now() };
         state.replay = null;
         replayFrame = null;
         broadcast();
     }
 
+    // Reviews always run on the board, so the LEDs, buzzer and replay are real.
     function requestReview() {
-        if (state.pending) {
-            return;
-        }
-
-        if (board) {
+        if (!state.pending && board) {
             sendToBoard("REVIEW");
-        } else {
-            openEvent(`demo-${demoId++}`, ["manual"], true);
         }
     }
 
@@ -141,13 +186,12 @@ function startServer({ httpPort = 3000, boardPort = 4000, host = "127.0.0.1" } =
             state.goals++;
         }
 
-        if (!pending.local) {
-            decided.set(id, result === "GOAL" ? "GOAL" : "NO_GOAL");
-            if (decided.size > MAX_DECIDED) {
-                decided.delete(decided.keys().next().value);
-            }
-            sendToBoard(`DECISION ${id} ${decided.get(id)}`);
+        // Kept by id, so a board that reconnects mid-review is told again.
+        decided.set(id, result === "GOAL" ? "GOAL" : "NO_GOAL");
+        if (decided.size > MAX_DECIDED) {
+            decided.delete(decided.keys().next().value);
         }
+        sendToBoard(`DECISION ${id} ${decided.get(id)}`);
 
         state.pending = null;
         state.replay = null;
@@ -178,7 +222,7 @@ function startServer({ httpPort = 3000, boardPort = 4000, host = "127.0.0.1" } =
                 if (state.pending) {
                     console.log(`Event ${state.pending.id} replaced by ${id}`);
                 }
-                openEvent(id, sources, false);
+                openEvent(id, sources);
             }
         } else if (type === "STATUS" && parts.length === 5) {
             const [, boardState, cameraState, irState, id] = parts;
@@ -213,16 +257,27 @@ function startServer({ httpPort = 3000, boardPort = 4000, host = "127.0.0.1" } =
                 state.pending.cameraReplay = parts[3];
                 broadcast();
             }
-        } else if (type === "STREAM" && parts.length === 2) {
+        } else if (type === "STREAM" && (parts.length === 2 || parts.length === 3)) {
+            // STREAM <port> [board IP] or STREAM -
             const port = Number(parts[1]);
 
             if (parts[1] === "-") {
                 state.board.stream = null;
             } else if (/^\d+$/.test(parts[1]) && isInt(port, 1, 65535)) {
-                // The board's address changes between networks, so use the one it connected from.
-                const address = (socket.remoteAddress || "").replace(/^::ffff:/, "");
-                const host = address.includes(":") ? `[${address}]` : address;
-                state.board.stream = `http://${host}:${port}/stream`;
+                // CAMERA_HOST wins; then the address the board reports for itself;
+                // the address it connected from is wrong behind NAT.
+                const reported = parts[2] && net.isIP(parts[2]) ? parts[2] : null;
+                const connected = (socket.remoteAddress || "").replace(/^::ffff:/, "");
+                const host = cameraHost || reported || connected;
+                state.board.stream = streamUrl(host, port);
+
+                if (state.board.stream !== loggedStream) {
+                    console.log(`Camera stream: ${state.board.stream}` +
+                        (cameraHost ? " (CAMERA_HOST)" : reported ? " (reported by the board)" : ""));
+                    loggedStream = state.board.stream;
+                }
+            } else {
+                return;
             }
 
             broadcast();
@@ -284,7 +339,7 @@ function startServer({ httpPort = 3000, boardPort = 4000, host = "127.0.0.1" } =
         });
 
         socket.on("replay", (data) => {
-            if (!data || !state.pending || state.pending.local) {
+            if (!data || !state.pending) {
                 return;
             }
 
@@ -409,12 +464,15 @@ function startServer({ httpPort = 3000, boardPort = 4000, host = "127.0.0.1" } =
     }));
 }
 
-module.exports = { startServer };
+module.exports = { startServer, validCameraHost, streamUrl };
 
 if (require.main === module) {
     startServer().then(({ httpPort, boardPort }) => {
-        console.log(`True Goal running on port ${httpPort}`);
+        console.log(`True Goal dashboard: http://localhost:${httpPort}`);
         console.log(`Waiting for BeagleY-AI on port ${boardPort}`);
+        console.log(process.env.CAMERA_HOST
+            ? `Camera host: ${process.env.CAMERA_HOST.trim()} (CAMERA_HOST)`
+            : "Camera host: detected from the board (set CAMERA_HOST to override)");
     }).catch((err) => {
         console.error(err.message);
         process.exit(1);
